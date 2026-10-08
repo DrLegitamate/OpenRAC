@@ -2,9 +2,11 @@
 // Copyright (c) 2026 the OpenRAC contributors
 #include "vu.h"
 
+#include <cfenv>
 #include <cmath>
 
 #include "fp.h"
+#include "fp_quad.h"
 
 namespace ps2 {
 namespace {
@@ -15,6 +17,15 @@ constexpr u32 kXyz = 14, kAll = 15;
 inline u32 divide_flags(u32 problems) {
   return ((problems & fp::kInvalid) ? 0x10u : 0u) | ((problems & fp::kDivideByZero) ? 0x20u : 0u);
 }
+
+// The four-field arithmetic needs the host to round towards zero while a
+// unit computes, and only then: other code on the thread expects the usual
+// rounding.
+struct TowardZero {
+  u64 saved = fp::host_rounding();
+  TowardZero() { fp::round_toward_zero(); }
+  ~TowardZero() { fp::set_host_rounding(saved); }
+};
 
 inline s32 sign_extend(u32 v, unsigned width) {
   u32 m = 1u << (width - 1);
@@ -31,7 +42,7 @@ constexpr unsigned kDiv = 7, kSqrt = 7, kRsqrt = 13;
 
 }  // namespace
 
-Vu::Vu(Memory memory) : memory_(memory), pc_mask_(memory.micro_bytes / 8 - 1) {
+Vu::Vu(Memory memory) : memory_(memory), pc_mask_(memory.micro_bytes / 8 - 1), needs_(memory.micro_bytes / 8) {
   reset();
 }
 
@@ -49,7 +60,7 @@ void Vu::reset() {
   flag_first_ = flag_count_ = 0;
   q_at_ = p_at_ = 0;
   cycle_ = 0;
-  written_ = {};
+  readable_ = {};
   branch_in_ = stop_in_ = kick_in_ = 0;
   backup_ttl_ = 0;
   pc = 0;
@@ -71,6 +82,7 @@ void Vu::start(u32 address) {
 }
 
 u64 Vu::advance(u64 instructions) {
+  TowardZero rounding;
   u64 count = 0;
   while (running_ && count < instructions) {
     step();
@@ -80,6 +92,7 @@ u64 Vu::advance(u64 instructions) {
 }
 
 u64 Vu::advance_to_sync(u64 limit) {
+  TowardZero rounding;
   u64 count = 0;
   sync_point_ = false;
   while (running_ && !sync_point_ && count < limit) {
@@ -90,6 +103,7 @@ u64 Vu::advance_to_sync(u64 limit) {
 }
 
 u64 Vu::resume(u64 limit) {
+  TowardZero rounding;
   running_ = true;
   u64 count = 0;
   while (running_ && count < limit) {
@@ -114,22 +128,27 @@ void Vu::finish_q() {
 void Vu::fire_kick() {
   kick_in_ = 0;
   if (on_kick) {
+    // What takes the packet (the GS) computes with the usual rounding.
+    u64 mode = fp::host_rounding();
+    fp::round_to_nearest();
     on_kick(kick_address_);
+    fp::set_host_rounding(mode);
   }
 }
 
-// The cycle at which this pair can run: the next one, or later if it reads
-// a float register that an instruction less than four cycles back wrote, or
-// needs the divider while it is busy.
-u64 Vu::ready_cycle(u32 up, u32 low) const {
-  struct Read {
-    unsigned reg;
-    u32 mask;
-  } reads[4];
-  unsigned count = 0;
+// What a pair reads that can make it wait: float registers (a register
+// written less than four cycles ago holds the pair up), the divider, the
+// function unit.
+void Vu::work_out(Needs& needs, u32 up, u32 low) const {
+  needs = Needs{};
+  needs.up = up;
+  needs.low = low;
+  needs.known = true;
   auto read = [&](unsigned reg, u32 mask) {
-    if (reg && mask) {
-      reads[count++] = {reg, mask};
+    if (reg && mask && needs.count < 4) {
+      needs.reg[needs.count] = static_cast<u8>(reg);
+      needs.mask[needs.count] = static_cast<u8>(mask);
+      needs.count++;
     }
   };
 
@@ -160,7 +179,6 @@ u64 Vu::ready_cycle(u32 up, u32 low) const {
     }
   }
 
-  u64 ready = cycle_ + 1;
   if (!(up & 0x80000000u)) {
     u32 op = low >> 25;
     u32 ldest = (low >> 21) & 0xF;
@@ -173,38 +191,113 @@ u64 Vu::ready_cycle(u32 up, u32 low) const {
         case 0x30: read(is, ldest); break;  // MOVE
         case 0x31: read(is, 15); break;     // MR32
         case 0x35: case 0x37: read(is, ldest); break;  // SQI, SQD
-        case 0x38: case 0x3A:  // DIV, RSQRT: and the divider must be free
+        case 0x38: case 0x3A:  // DIV, RSQRT
           read(is, fsf);
           read(it, ftf);
-          if (q_at_ > ready) ready = q_at_;
+          needs.wait = 1;
           break;
         case 0x39:  // SQRT
           read(it, ftf);
-          if (q_at_ > ready) ready = q_at_;
+          needs.wait = 1;
           break;
-        case 0x3B:  // WAITQ
-          if (q_at_ > ready) ready = q_at_;
-          break;
+        case 0x3B: needs.wait = 1; break;  // WAITQ
         case 0x3C: case 0x42: case 0x43: read(is, fsf); break;  // MTIR, RINIT, RXOR
         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: read(is, 14); break;
         case 0x76: read(is, 15); break;
         case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E: read(is, fsf); break;
-        case 0x7B:  // WAITP
-          if (p_at_ > ready) ready = p_at_;
-          break;
+        case 0x7B: needs.wait = 2; break;  // WAITP
         default: break;
       }
     }
   }
+}
 
-  for (unsigned n = 0; n < count; n++) {
-    for (const Written& w : written_) {
-      if (w.reg == reads[n].reg && (w.mask & reads[n].mask) && w.cycle + 4 > ready) {
-        ready = w.cycle + 4;
-      }
+void Vu::program_changed() {
+  for (Needs& n : needs_) {
+    n.known = false;
+  }
+  programs_looked_at_ = false;
+}
+
+namespace {
+
+// Does this upper instruction set MAC and status flags?
+inline bool sets_flags(u32 up) {
+  u32 fn = up & 0x3F;
+  if (fn < 0x10 || (fn >= 0x18 && fn <= 0x1C) || fn == 0x1E || (fn >= 0x20 && fn <= 0x2A) || (fn >= 0x2C && fn <= 0x2E)) {
+    return true;
+  }
+  if (fn < 0x3C) {
+    return false;
+  }
+  u32 index = (((up >> 6) & 0x1F) << 2) | (up & 3);
+  return index < 0x10 || (index >= 0x18 && index <= 0x1C) || index == 0x1E || (index >= 0x20 && index <= 0x2A) ||
+         (index >= 0x2C && index <= 0x2E);
+}
+
+// Lower instructions that read the MAC or status flags.
+inline bool reads_flags(u32 low) {
+  u32 op = low >> 25;
+  return op == 0x14 || op == 0x16 || op == 0x17 || op == 0x18 || op == 0x1A || op == 0x1B;
+}
+
+}  // namespace
+
+// What is in program memory as a whole: does anything read flags in a way
+// that depends on every instruction (the bits that remember, the MAC flags)?
+void Vu::look_at_programs() {
+  programs_looked_at_ = true;
+  sticky_readers_ = false;
+  for (u32 n = 0; n <= pc_mask_; n++) {
+    u32 low = load<u32>(memory_.micro + n * 8), up = load<u32>(memory_.micro + n * 8 + 4);
+    if (up & 0x80000000u) {
+      continue;
+    }
+    u32 op = low >> 25;
+    u32 imm12 = ((low >> 10) & 0x800) | (low & 0x7FF);
+    if (op == 0x15 || op == 0x18 || op == 0x1A || op == 0x1B || ((op == 0x14 || op == 0x16 || op == 0x17) && (imm12 & 0xFC0))) {
+      sticky_readers_ = true;
+      return;
     }
   }
-  return ready;
+}
+
+// Can any instruction read the flags the upper instruction at `at` sets?
+// They are seen from four cycles on and until the next instruction that
+// sets flags has had its four cycles. A reader in that stretch, or anything
+// that leaves the straight line (a branch, the end of the program), counts.
+bool Vu::flags_can_be_read(u32 at) const {
+  if (!skip_unread_flags || sticky_readers_) {
+    return true;
+  }
+  int next_setter = -1;
+  // (From the pair before: if that one branches, this is its delay slot and
+  // what follows is somewhere else. The pair itself is looked at only for a
+  // branch.)
+  for (int n = -1; n <= 40; n++) {
+    u32 where = (at + static_cast<u32>(n)) & pc_mask_;
+    u32 low = load<u32>(memory_.micro + where * 8), up = load<u32>(memory_.micro + where * 8 + 4);
+    if (up & 0x40000000u) {
+      return true;
+    }
+    if (!(up & 0x80000000u)) {
+      u32 op = low >> 25;
+      if ((n > 0 && reads_flags(low)) || (op >= 0x20 && op <= 0x2F)) {
+        return true;
+      }
+    }
+    if (n <= 0) {
+      continue;
+    }
+    if (next_setter < 0 && sets_flags(up)) {
+      next_setter = n;
+    }
+    // Five more pairs after the next setter: its four cycles, and one over.
+    if (next_setter >= 0 && n >= next_setter + 5) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void Vu::step() {
@@ -212,8 +305,30 @@ void Vu::step() {
   u32 low = load<u32>(memory_.micro + at * 8), up = load<u32>(memory_.micro + at * 8 + 4);
   pc = (pc + 1) & pc_mask_;
 
-  // When this pair runs, and what has arrived by then.
-  cycle_ = ready_cycle(up, low);
+  // When this pair runs: the next cycle, or later if it reads a float
+  // register not yet readable, or needs a unit that is busy.
+  Needs& needs = needs_[at];
+  if (!needs.known || needs.up != up || needs.low != low) {
+    if (!programs_looked_at_) {
+      look_at_programs();
+    }
+    work_out(needs, up, low);
+    needs.flags_wanted = !sets_flags(up) || flags_can_be_read(at);
+  }
+  flags_wanted_ = needs.flags_wanted;
+  u64 ready = cycle_ + 1;
+  for (unsigned n = 0; n < needs.count; n++) {
+    const std::array<u64, 4>& fields = readable_[needs.reg[n]];
+    u32 mask = needs.mask[n];
+    if ((mask & 8) && fields[0] > ready) ready = fields[0];
+    if ((mask & 4) && fields[1] > ready) ready = fields[1];
+    if ((mask & 2) && fields[2] > ready) ready = fields[2];
+    if ((mask & 1) && fields[3] > ready) ready = fields[3];
+  }
+  if (needs.wait == 1 && q_at_ > ready) ready = q_at_;
+  if (needs.wait == 2 && p_at_ > ready) ready = p_at_;
+  cycle_ = ready;
+  // What has arrived by then.
   while (flag_count_ && flag_pipe_[flag_first_].at <= cycle_) {
     const Flags& f = flag_pipe_[flag_first_];
     mac = f.mac;
@@ -299,7 +414,6 @@ void Vu::settle() {
     p = p_next_;
     p_at_ = 0;
   }
-  written_ = {};
   if (kick_in_) {
     fire_kick();
   }
@@ -307,7 +421,9 @@ void Vu::settle() {
 }
 
 void Vu::macro(u32 code) {
+  TowardZero rounding;
   in_upper_ = false;
+  flags_wanted_ = true;
   u32 fn = code & 0x3F;
   if (fn < 0x30) {
     upper(code);
@@ -390,8 +506,11 @@ void Vu::write_vf(unsigned reg, u32 mask, const std::array<u32, 4>& value) {
     upper_old_ = vf[reg];
   }
   if (timed_) {
-    written_[written_next_] = {static_cast<u8>(reg), static_cast<u8>(mask), cycle_};
-    written_next_ = (written_next_ + 1) & 7;
+    for (unsigned field = 0; field < 4; field++) {
+      if (has(mask, field)) {
+        readable_[reg][field] = cycle_ + 4;
+      }
+    }
   }
   for (unsigned field = 0; field < 4; field++) {
     if (has(mask, field)) {
@@ -499,40 +618,102 @@ void Vu::post_flags(u32 mac_bits) {
 
 void Vu::arith(u32 code, Op op, From from, bool to_acc) {
   u32 dest = (code >> 21) & 0xF;
-  unsigned fs = (code >> 11) & 31, fd = (code >> 6) & 31;
+  unsigned ft = (code >> 16) & 31, fs = (code >> 11) & 31, fd = (code >> 6) & 31;
   std::array<u32, 4> out = to_acc ? acc : vf[fd];
   u32 flags = 0;
-  for (unsigned field = 0; field < 4; field++) {
-    if (!has(dest, field)) {
-      continue;
+
+  // The second operand, a value a field.
+  std::array<u32, 4> b;
+  switch (from) {
+    case From::Ft:
+      b = vf[ft];
+      break;
+    case From::Bc:
+      b.fill(vf[ft][code & 3]);
+      break;
+    case From::Q:
+      b.fill(q);
+      break;
+    default:
+      b.fill(i);
+      break;
+  }
+  const std::array<u32, 4>& a = vf[fs];
+
+  // All four fields at once where every field wanted is an ordinary number.
+  std::array<u32, 4> quick, product;
+  bool fast = false;
+  switch (op) {
+    case Op::Add:
+      fast = fp::quad_add(a.data(), b.data(), dest, quick.data());
+      break;
+    case Op::Sub:
+      fast = fp::quad_add(a.data(), b.data(), dest, quick.data(), true);
+      break;
+    case Op::Mul:
+      fast = fp::quad_mul(a.data(), b.data(), dest, quick.data());
+      break;
+    case Op::Madd:
+      fast = fp::quad_mul(a.data(), b.data(), dest, product.data()) && fp::quad_add(acc.data(), product.data(), dest, quick.data());
+      break;
+    default:
+      fast = fp::quad_mul(a.data(), b.data(), dest, product.data()) &&
+             fp::quad_add(acc.data(), product.data(), dest, quick.data(), true);
+      break;
+  }
+  if (fast && !flags_wanted_) {
+    for (unsigned field = 0; field < 4; field++) {
+      if (has(dest, field)) {
+        out[field] = quick[field];
+      }
     }
-    u32 a = vf[fs][field], b = operand(code, from, field);
-    u32 problems = 0, value;
-    switch (op) {
-      case Op::Add:
-        value = fp::add(a, b, problems);
-        break;
-      case Op::Sub:
-        value = fp::sub(a, b, problems);
-        break;
-      case Op::Mul:
-        value = fp::mul(a, b, problems);
-        break;
-      case Op::Madd:
-        value = fp::add(acc[field], fp::mul(a, b, problems), problems);
-        break;
-      default:
-        value = fp::sub(acc[field], fp::mul(a, b, problems), problems);
-        break;
+    if (to_acc) {
+      acc = out;
+    } else {
+      write_vf(fd, kAll, out);
     }
-    out[field] = result(value, problems, field, flags);
+    return;
+  }
+  if (fast) {
+    for (unsigned field = 0; field < 4; field++) {
+      if (has(dest, field)) {
+        out[field] = result(quick[field], 0, field, flags);
+      }
+    }
+  } else {
+    for (unsigned field = 0; field < 4; field++) {
+      if (!has(dest, field)) {
+        continue;
+      }
+      u32 problems = 0, value;
+      switch (op) {
+        case Op::Add:
+          value = fp::add(a[field], b[field], problems);
+          break;
+        case Op::Sub:
+          value = fp::sub(a[field], b[field], problems);
+          break;
+        case Op::Mul:
+          value = fp::mul(a[field], b[field], problems);
+          break;
+        case Op::Madd:
+          value = fp::add(acc[field], fp::mul(a[field], b[field], problems), problems);
+          break;
+        default:
+          value = fp::sub(acc[field], fp::mul(a[field], b[field], problems), problems);
+          break;
+      }
+      out[field] = result(value, problems, field, flags);
+    }
   }
   if (to_acc) {
     acc = out;
   } else {
     write_vf(fd, kAll, out);
   }
-  post_flags(flags);
+  if (flags_wanted_) {
+    post_flags(flags);
+  }
 }
 
 void Vu::min_max(u32 code, From from, bool max) {
@@ -870,10 +1051,17 @@ void Vu::lower_special(u32 code) {
     u32 x = (r >> 4) & 1, y = (r >> 22) & 1;
     r = (((r << 1) ^ x ^ y) & 0x7FFFFF) | 0x3F800000;
   };
-  double x = fp::to_double(vf[is][0]), y = fp::to_double(vf[is][1]), z = fp::to_double(vf[is][2]);
-  double one = fp::to_double(vf[is][fsf]);
+  u32 index = (((code >> 6) & 0x1F) << 2) | (code & 3);
+  // The function unit's operands, for the instructions that use it.
+  double x = 0, y = 0, z = 0, one = 0;
+  if (index >= 0x70) {
+    x = fp::to_double(vf[is][0]);
+    y = fp::to_double(vf[is][1]);
+    z = fp::to_double(vf[is][2]);
+    one = fp::to_double(vf[is][fsf]);
+  }
 
-  switch ((((code >> 6) & 0x1F) << 2) | (code & 3)) {
+  switch (index) {
     case 0x30:  // MOVE
       write_vf(it, dest, vf[is]);
       break;
