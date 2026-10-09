@@ -34,8 +34,11 @@ target_include_directories(openrac_ps2 PUBLIC src/ps2 src)
 # library functions answered by the runtime.
 add_library(openrac_sys STATIC
   src/sys/disc.cpp
+  src/sys/drawing.cpp
   src/sys/machine.cpp
+  src/sys/memcard.cpp
   src/sys/services.cpp
+  src/sys/sound.cpp
 )
 target_include_directories(openrac_sys PUBLIC src)
 target_link_libraries(openrac_sys PUBLIC openrac_ps2)
@@ -62,6 +65,9 @@ endif()
 # Tools that read a file from your own disc and report on it.
 add_executable(openrac-vuscan src/app/vuscan.cpp)
 target_link_libraries(openrac-vuscan PRIVATE openrac_ps2)
+
+add_executable(openrac-vubench src/app/vubench.cpp)
+target_link_libraries(openrac-vubench PRIVATE openrac_ps2)
 
 enable_testing()
 add_executable(openrac-ps2-tests tests/test_ps2.cpp)

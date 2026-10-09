@@ -2,6 +2,8 @@
 // Copyright (c) 2026 the OpenRAC contributors
 #include "gs.h"
 
+#include "fp_quad.h"
+
 #include <algorithm>
 #include <bit>
 #include <climits>
@@ -161,6 +163,88 @@ class Gs::Pool {
   bool quit_ = false;
 };
 
+// The thread that draws batches, one after the other, in the order given.
+class Gs::Raster {
+ public:
+  explicit Raster(Gs& gs) : gs_(gs), thread_([this] { loop(); }) {}
+  ~Raster() {
+    {
+      std::lock_guard lock(mutex_);
+      quit_ = true;
+    }
+    work_.notify_all();
+    thread_.join();
+  }
+
+  // Takes the batch; gives back an empty one to gather into.
+  std::unique_ptr<Batch> give(std::unique_ptr<Batch> batch) {
+    std::unique_ptr<Batch> next;
+    {
+      std::unique_lock lock(mutex_);
+      done_.wait(lock, [this] { return queue_.size() < 8; });  // no further ahead than this
+      queue_.push_back(std::move(batch));
+      if (!spare_.empty()) {
+        next = std::move(spare_.back());
+        spare_.pop_back();
+      }
+    }
+    work_.notify_one();
+    return next ? std::move(next) : std::make_unique<Batch>();
+  }
+  void wait() {
+    std::unique_lock lock(mutex_);
+    done_.wait(lock, [this] { return queue_.empty() && !busy_; });
+  }
+  bool idle() {
+    std::lock_guard lock(mutex_);
+    return queue_.empty() && !busy_;
+  }
+
+ private:
+  void loop() {
+    std::unique_lock lock(mutex_);
+    for (;;) {
+      work_.wait(lock, [this] { return quit_ || !queue_.empty(); });
+      if (queue_.empty()) {
+        return;
+      }
+      std::unique_ptr<Batch> batch = std::move(queue_.front());
+      queue_.pop_front();
+      busy_ = true;
+      lock.unlock();
+      gs_.render(*batch);
+      batch->clear();
+      lock.lock();
+      busy_ = false;
+      if (spare_.size() < 8) {
+        spare_.push_back(std::move(batch));
+      }
+      done_.notify_all();
+    }
+  }
+
+  Gs& gs_;
+  std::mutex mutex_;
+  std::condition_variable work_, done_;
+  std::deque<std::unique_ptr<Batch>> queue_;
+  std::vector<std::unique_ptr<Batch>> spare_;
+  bool busy_ = false, quit_ = false;
+  std::thread thread_;  // last: it starts using the rest at once
+};
+
+void Gs::Batch::clear() {
+  serial = false;
+  task = nullptr;
+  primitives.clear();
+  for (u16 band : used_bands) {
+    bands[band].clear();
+  }
+  used_bands.clear();
+  envs.clear();
+  cluts.clear();
+  textures.clear();
+}
+
 namespace {
 
 constexpr unsigned kBandShift = 4;  // a band is 16 scan lines
@@ -174,11 +258,13 @@ Gs::Gs() {
 Gs::~Gs() = default;
 
 void Gs::set_threads(unsigned threads) {
-  flush();
-  threads_ = threads;
+  finish();
+  raster_.reset();
   pool_.reset();
+  threads_ = threads;
   if (threads > 1) {
-    pool_ = std::make_unique<Pool>(threads - 1);  // the caller is one of them
+    pool_ = std::make_unique<Pool>(threads - 1);  // the thread that draws batches is one of them
+    raster_ = std::make_unique<Raster>(*this);
   }
 }
 
@@ -196,20 +282,20 @@ void Gs::reset() {
   clut_cbp_.fill(0);
   in_ = Transfer{};
   out_ = Transfer{};
+  if (raster_) {
+    raster_->wait();
+  }
   texture_cache_.clear();
-  retired_.clear();
   page_stamp_.fill(0);
   clock_ = 1;
-  waiting_.clear();
-  for (u16 band : used_bands_) {
-    bands_[band].clear();
-  }
-  used_bands_.clear();
+  batch_ = std::make_unique<Batch>();
+  clut_load_ = ClutLoad{};
   pending_write_.clear();
   pending_read_.clear();
-  envs_.clear();
-  levels_.clear();
-  clut_copies_.clear();
+  pending_colour_.clear();
+  pending_depth_.clear();
+  inflight_write_.clear();
+  inflight_read_.clear();
   env_ = nullptr;
   env_dirty_ = clut_copy_dirty_ = true;
 }
@@ -495,18 +581,12 @@ Gs::Env Gs::environment() {
     t.aem = bits(texa, 15, 1) != 0;
     if (t.kind >= kTex8) {
       // The table as it is now: it may be loaded again before this is drawn.
-      if (clut_copy_dirty_ || clut_copies_.empty()) {
-        clut_copies_.push_back(clut_);
+      if (clut_copy_dirty_ || batch_->cluts.empty()) {
+        batch_->cluts.push_back(ClutCopy{clut_, 0, false});
         clut_copy_dirty_ = false;
       }
-      t.clut = clut_copies_.back().data();
-    }
-    levels_.emplace_back();
-    t.levels = &levels_.back();
-    u32 levels = (t.mxl > 0 && t.mmin >= 2) ? t.mxl : 0;
-    for (u32 level = 0; level <= levels; level++) {
-      s32 w = std::max(1, (1 << t.tw) >> level), h = std::max(1, (1 << t.th) >> level);
-      add_pages(e.tex_pages, t.psm, t.tbp[level], t.tbw[level], 0, 0, w - 1, h - 1);
+      t.clut_source = &batch_->cluts.back();
+      t.clut = t.clut_source->colours.data();
     }
     // The level of detail comes from each pixel's Q only when it is not
     // fixed (LCM), the coordinates carry a Q, and something depends on it:
@@ -601,82 +681,161 @@ void Gs::vertex(u16 x, u16 y, u32 z, bool draw) {
 
 // --- gathering and drawing -----------------------------------------------------
 
-void Gs::submit(unsigned kind, unsigned count) {
-  if (env_dirty_ || !env_) {
-    if (waiting_.empty()) {
-      // Nothing waiting refers to the old states: let them go.
-      envs_.clear();
-      levels_.clear();
-      clut_copies_.clear();
-      clut_copy_dirty_ = true;
-      retired_.clear();
-    }
-    envs_.push_back(environment());
-    env_ = &envs_.back();
-    env_dirty_ = false;
+void Gs::ensure_env() {
+  if (!env_dirty_ && env_) {
+    return;
   }
-  const Env& e = *env_;
+  if (clut_load_.waiting) {
+    // The colour table is needed now if this state's texture uses one.
+    u32 prim = prim_bits();
+    if (((prim >> 4) & 1) && (bits(reg_[TEX0_1 + ((prim >> 9) & 1)], 20, 6) & 7) >= 3) {
+      do_clut_load();  // (may hand the batch over)
+    }
+  }
+  Batch& batch = *batch_;
+  if (batch.primitives.empty()) {
+    // Nothing gathered refers to the older states: let them go.
+    batch.envs.clear();
+    batch.cluts.clear();
+    batch.textures.clear();
+    clut_copy_dirty_ = true;
+  }
+  batch.envs.push_back(environment());
+  env_ = &batch.envs.back();
+  env_dirty_ = false;
+}
+
+void Gs::submit(unsigned kind, unsigned count) {
+  ensure_env();
   stats.primitives++;
   if (on_primitive) {
-    report(e, count);
+    report(*env_, count);
   }
 
   // The pixels it can reach, generously, inside the scissor rectangle.
   s32 x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
-  for (unsigned n = 0; n < count; n++) {
-    s32 x = static_cast<s32>(queue_[n].x) - e.ofx, y = static_cast<s32>(queue_[n].y) - e.ofy;
-    x0 = std::min(x0, x);
-    y0 = std::min(y0, y);
-    x1 = std::max(x1, x);
-    y1 = std::max(y1, y);
+  Pages written, depth;
+  u32 need = 0;
+  {
+    const Env& e = *env_;
+    for (unsigned n = 0; n < count; n++) {
+      s32 x = static_cast<s32>(queue_[n].x) - e.ofx, y = static_cast<s32>(queue_[n].y) - e.ofy;
+      x0 = std::min(x0, x);
+      y0 = std::min(y0, y);
+      x1 = std::max(x1, x);
+      y1 = std::max(y1, y);
+    }
+    x0 = std::max(x0 >> 4, e.sx0);
+    y0 = std::max(y0 >> 4, e.sy0);
+    x1 = std::min((x1 + 15) >> 4, e.sx1);
+    y1 = std::min((y1 + 15) >> 4, e.sy1);
+    if (x0 > x1 || y0 > y1) {
+      return;
+    }
+    add_pages(written, e.fpsm, e.fbp, e.fbw, x0, y0, x1, y1);
+    if (e.zte && !e.zmsk) {
+      add_pages(depth, e.zpsm, e.zbp, e.fbw, x0, y0, x1, y1);
+    }
+    // The levels of the texture it can read. A game leaves the levels it
+    // does not need unloaded (their addresses point anywhere, often at the
+    // frame), so only these count.
+    if (e.tme) {
+      need = levels_needed(e, count);
+    }
   }
-  x0 = std::max(x0 >> 4, e.sx0);
-  y0 = std::max(y0 >> 4, e.sy0);
-  x1 = std::min((x1 + 15) >> 4, e.sx1);
-  y1 = std::min((y1 + 15) >> 4, e.sy1);
-  if (x0 > x1 || y0 > y1) {
-    return;
+  // A colour table load put off must see memory as it was before this.
+  if (clut_load_.waiting && (written.intersects(clut_load_.source) || depth.intersects(clut_load_.source))) {
+    do_clut_load();
   }
-  Pages written;
-  add_pages(written, e.fpsm, e.fbp, e.fbw, x0, y0, x1, y1);
-  if (e.zte && !e.zmsk) {
-    add_pages(written, e.zpsm, e.zbp, e.fbw, x0, y0, x1, y1);
-  }
+  // From here on the state may be replaced by a copy in the next batch:
+  // whenever what was gathered is handed over to be drawn.
+  prepare_levels(need);
 
-  Queued q{&e, static_cast<u8>(kind), {queue_[0], queue_[1], queue_[2]}};
   // A primitive whose texture is in the memory it draws to (the games blur
-  // and distort the frame that way) is drawn alone, top to bottom.
-  bool feeds_itself = e.tme && e.tex_pages.intersects(written);
-  if (threads_ == 0 || feeds_itself) {
+  // and distort the frame that way) is drawn alone, top to bottom. So is one
+  // whose depth values go where its colours go (a game clears a buffer
+  // through the depth side that way): the two are laid out differently in
+  // memory, so one row's depth is another row's colour.
+  // (Of a level read in place, a frame as a rule, only the part the
+  // primitive's coordinates reach counts, where that can be told.)
+  Pages reach, reads = env_->decoded_pages;
+  bool in_place = need && (need & env_->in_place);
+  if (in_place) {
+    if (!in_place_reach(*env_, count, need, reach)) {
+      reach = env_->in_place_pages;
+    }
+    reads.add(reach);
+  }
+  bool feeds_itself = (need && (reads.intersects(written) || reads.intersects(depth))) || depth.intersects(written);
+  // And colours and depth values of different primitives must not meet in
+  // one batch, whose bands are drawn side by side.
+  if (depth.intersects(pending_colour_) || written.intersects(pending_depth_)) {
     flush();
+    prepare_levels(need);
+  }
+  Pages colour = written;
+  written.add(depth);
+  if (threads_ == 0 || (feeds_itself && !raster_)) {
+    flush();
+    wait_for_drawing();
+    prepare_levels(need);
     stamp(written);
+    Queued q{env_, static_cast<u8>(kind), {queue_[0], queue_[1], queue_[2]}};
     draw(q, 0, 2047);
-    stats.pixels += tls_pixels;
+    stats.pixels = pixels_.fetch_add(tls_pixels, std::memory_order_relaxed) + tls_pixels;
     tls_pixels = 0;
     return;
   }
-
-  // Draw what is waiting first if this primitive reads what it writes, writes
-  // what it reads, or draws to other buffers.
-  if ((e.tme && e.tex_pages.intersects(pending_write_)) || written.intersects(pending_read_) ||
-      (!waiting_.empty() && e.target != pending_target_)) {
+  // With a thread that draws batches, such primitives go to it in a batch of
+  // their own kind, drawn one primitive after the other.
+  if (feeds_itself != batch_->serial && !batch_->primitives.empty()) {
     flush();
+    prepare_levels(need);
   }
+  if (feeds_itself) {
+    batch_->serial = true;
+    stamp(written);
+    pending_target_ = env_->target;
+    pending_write_.add(written);
+    pending_colour_.add(colour);
+    pending_depth_.add(depth);
+    if (in_place) {
+      pending_read_.add(reach);  // (decoded levels were taken when they were looked at)
+    }
+    batch_->primitives.push_back(Queued{env_, static_cast<u8>(kind), {queue_[0], queue_[1], queue_[2]}});
+    if (batch_->primitives.size() >= 1024) {
+      flush();
+    }
+    return;
+  }
+
+  // Start another batch if this primitive reads in place what the gathered
+  // ones write, writes what they read in place, or draws to other buffers.
+  // (Decoded levels were taken when they were looked at.)
+  if ((in_place && reach.intersects(pending_write_)) || written.intersects(pending_read_) ||
+      (!batch_->primitives.empty() && env_->target != pending_target_)) {
+    flush();
+    prepare_levels(need);
+  }
+  Batch& batch = *batch_;
+  const Env& e = *env_;
   pending_target_ = e.target;
   stamp(written);
   pending_write_.add(written);
-  if (e.tme) {
-    pending_read_.add(e.tex_pages);
+  pending_colour_.add(colour);
+  pending_depth_.add(depth);
+  if (in_place) {
+    pending_read_.add(reach);
   }
-  u32 index = static_cast<u32>(waiting_.size());
-  waiting_.push_back(q);
+  u32 index = static_cast<u32>(batch.primitives.size());
+  batch.primitives.push_back(Queued{&e, static_cast<u8>(kind), {queue_[0], queue_[1], queue_[2]}});
   for (s32 band = y0 >> kBandShift; band <= (y1 >> kBandShift); band++) {
-    if (bands_[static_cast<unsigned>(band)].empty()) {
-      used_bands_.push_back(static_cast<u16>(band));
+    if (batch.bands[static_cast<unsigned>(band)].empty()) {
+      batch.used_bands.push_back(static_cast<u16>(band));
     }
-    bands_[static_cast<unsigned>(band)].push_back(index);
+    batch.bands[static_cast<unsigned>(band)].push_back(index);
   }
-  if (waiting_.size() >= 16384) {
+  if (batch.primitives.size() >= 16384) {
     flush();
   }
 }
@@ -690,44 +849,102 @@ void Gs::draw(const Queued& q, s32 clip0, s32 clip1) {
   }
 }
 
-void Gs::render_band(unsigned band) {
+void Gs::render_band(const Batch& batch, unsigned band) {
   s32 first = static_cast<s32>(band << kBandShift), last = first + (1 << kBandShift) - 1;
-  for (u32 index : bands_[band]) {
-    draw(waiting_[index], first, last);
+  for (u32 index : batch.bands[band]) {
+    draw(batch.primitives[index], first, last);
+  }
+}
+
+// Draw a batch: on the calling thread alone when it is small or there is no
+// pool, else with the pool, a band at a time each.
+void Gs::render(const Batch& batch) {
+  if (batch.task) {
+    batch.task();
+  } else if (batch.serial) {
+    for (const Queued& q : batch.primitives) {
+      draw(q, 0, 2047);
+    }
+    pixels_.fetch_add(tls_pixels, std::memory_order_relaxed);
+    tls_pixels = 0;
+  } else if (!pool_ || batch.primitives.size() < 8) {
+    for (u16 band : batch.used_bands) {
+      render_band(batch, band);
+    }
+    pixels_.fetch_add(tls_pixels, std::memory_order_relaxed);
+    tls_pixels = 0;
+  } else {
+    pool_->run(static_cast<unsigned>(batch.used_bands.size()), [&](unsigned item) {
+      render_band(batch, batch.used_bands[item]);
+      pixels_.fetch_add(tls_pixels, std::memory_order_relaxed);
+      tls_pixels = 0;
+    });
   }
 }
 
 void Gs::flush() {
-  if (waiting_.empty()) {
+  if (batch_->primitives.empty()) {
     return;
   }
   stats.flushes++;
-  if (!pool_ || waiting_.size() < 8) {
-    for (u16 band : used_bands_) {
-      render_band(band);
+  if (raster_) {
+    if (raster_->idle()) {
+      inflight_write_.clear();
+      inflight_read_.clear();
     }
-    stats.pixels += tls_pixels;
-    tls_pixels = 0;
+    inflight_write_.add(pending_write_);
+    inflight_read_.add(pending_read_);
+    batch_ = raster_->give(std::move(batch_));
   } else {
-    std::atomic<u64> pixels{0};
-    pool_->run(static_cast<unsigned>(used_bands_.size()), [&](unsigned item) {
-      render_band(used_bands_[item]);
-      pixels.fetch_add(tls_pixels);
-      tls_pixels = 0;
-    });
-    stats.pixels += pixels.load();
+    render(*batch_);
+    batch_->clear();
   }
-  waiting_.clear();
-  for (u16 band : used_bands_) {
-    bands_[band].clear();
-  }
-  used_bands_.clear();
   pending_write_.clear();
   pending_read_.clear();
+  pending_colour_.clear();
+  pending_depth_.clear();
+  // The states went with the batch.
+  env_ = nullptr;
+  env_dirty_ = clut_copy_dirty_ = true;
+}
+
+void Gs::wait_for_drawing() {
+  if (raster_) {
+    raster_->wait();
+  }
+  inflight_write_.clear();
+  inflight_read_.clear();
+}
+
+void Gs::finish() {
+  flush();
+  wait_for_drawing();
+  stats.pixels = pixels_.load();
+}
+
+void Gs::before_read(const Pages& pages) {
+  if (pages.intersects(pending_write_)) {
+    flush();
+  }
+  if (pages.intersects(inflight_write_)) {
+    wait_for_drawing();
+  }
+}
+
+void Gs::before_write(const Pages& pages) {
+  if (clut_load_.waiting && pages.intersects(clut_load_.source)) {
+    do_clut_load();  // a colour table load put off: it reads this memory as it was
+  }
+  if (pages.intersects(pending_write_) || pages.intersects(pending_read_)) {
+    flush();
+  }
+  if (pages.intersects(inflight_write_) || pages.intersects(inflight_read_)) {
+    wait_for_drawing();
+  }
 }
 
 void Gs::report(const Env& e, unsigned count) const {
-  char text[320];
+  char text[448];
   u32 prim = prim_bits();
   int n = std::snprintf(text, sizeof(text), "prim %u%s%s%s%s ctx%u | frame %u/%u psm %02x mask %08x | z %u psm %02x%s | scissor %d-%d,%d-%d | test %s%u/%02x/%u%s z%s%u | ",
                         prim & 7, e.iip ? " gouraud" : "", e.fge ? " fog" : "", e.abe ? " blend" : "", e.fst ? " uv" : "",
@@ -739,9 +956,12 @@ void Gs::report(const Env& e, unsigned count) const {
   }
   if (e.tme) {
     const Texture& t = e.tex;
-    std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "tex %u/%u psm %02x %ux%u tfx %u%s wrap %u%u filter %u%u mxl %u k %.2f%s",
-                  t.tbp[0], t.tbw[0], t.psm, 1u << t.tw, 1u << t.th, t.tfx, t.tcc ? " tcc" : "", t.wms, t.wmt, t.mmag, t.mmin,
-                  t.mxl, static_cast<double>(t.k), t.lcm ? " lcm" : "");
+    n += std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "tex %u/%u psm %02x %ux%u tfx %u%s wrap %u%u filter %u%u mxl %u l %u k %.2f%s",
+                       t.tbp[0], t.tbw[0], t.psm, 1u << t.tw, 1u << t.th, t.tfx, t.tcc ? " tcc" : "", t.wms, t.wmt, t.mmag, t.mmin,
+                       t.mxl, t.l, static_cast<double>(t.k), t.lcm ? " lcm" : "");
+    for (u32 level = 1; level <= t.mxl && n < static_cast<int>(sizeof(text)) - 16; level++) {
+      n += std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "%s%u/%u", level == 1 ? " mips " : ",", t.tbp[level], t.tbw[level]);
+    }
   } else {
     std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "no texture");
   }
@@ -753,7 +973,18 @@ void Gs::report(const Env& e, unsigned count) const {
     x1 = std::max(x1, x);
     y1 = std::max(y1, y);
   }
-  on_primitive(text, x0, y0, x1, y1);
+  // The level of detail at the vertices, where the texture has levels.
+  float lod0 = 0, lod1 = 0;
+  if (e.tme && e.tex.lod_per_pixel) {
+    lod0 = 1e9f;
+    lod1 = -1e9f;
+    for (unsigned v = 0; v < count; v++) {
+      float lod = static_cast<float>(-std::log2(std::fabs(static_cast<double>(queue_[v].q))) * static_cast<double>(1u << e.tex.l)) + e.tex.k;
+      lod0 = std::min(lod0, lod);
+      lod1 = std::max(lod1, lod);
+    }
+  }
+  on_primitive(text, x0, y0, x1, y1, lod0, lod1);
 }
 
 // --- decoded textures ----------------------------------------------------------
@@ -794,22 +1025,144 @@ void Gs::stamp(const Pages& pages) {
   }
 }
 
-// Find, once, the decoded copy of a level for the primitives of one state.
-// Any drawing thread may be the first to need it.
-void Gs::resolve_level(const Texture& t, u32 level) const {
-  std::lock_guard lock(texture_mutex_);
-  u32 bit = 1u << level;
-  if (t.levels->looked_up.load(std::memory_order_relaxed) & bit) {
-    return;
+// Which levels of its texture the primitive in the queue can read. The level
+// of detail follows Q, and Q anywhere in a primitive lies between its
+// vertices' values; this mirrors `sample`, with a little room for rounding.
+u32 Gs::levels_needed(const Env& e, unsigned count) const {
+  const Texture& t = e.tex;
+  if (t.mxl == 0 || t.mmin < 2) {
+    return 1;
   }
-  u32 w = std::max(1u, (1u << t.tw) >> level), h = std::max(1u, (1u << t.th) >> level);
-  // A large level (a frame buffer read as a texture) is cheaper read in place.
-  const u32* decoded = w * h <= 256u * 256u ? const_cast<Gs*>(this)->cached_level(t, level) : nullptr;
-  t.levels->cached[level].store(decoded, std::memory_order_relaxed);
-  t.levels->looked_up.fetch_or(bit, std::memory_order_release);
+  float low = t.k, high = t.k;
+  if (t.lod_per_pixel) {
+    float least = std::fabs(queue_[0].q), most = least;
+    for (unsigned n = 1; n < count; n++) {
+      float q = std::fabs(queue_[n].q);
+      least = std::min(least, q);
+      most = std::max(most, q);
+    }
+    float scale = static_cast<float>(1u << t.l);
+    low = -std::log2(most) * scale + t.k - 1.0f / 32;
+    high = -std::log2(least) * scale + t.k + 1.0f / 32;
+    if (!(low <= high)) {
+      return (2u << t.mxl) - 1;  // not numbers: any level
+    }
+  }
+  if (high <= 0.0f) {
+    return 1;
+  }
+  float top = static_cast<float>(t.mxl);
+  u32 first, last;
+  if (t.mmin == 2 || t.mmin == 4) {
+    first = low <= 0.0f ? 0 : static_cast<u32>(std::min(low + 0.5f, top));
+    last = static_cast<u32>(std::min(high + 0.5f, top));
+  } else {
+    first = low <= 0.0f ? 0 : static_cast<u32>(std::min(low, top));
+    last = std::min(static_cast<u32>(std::min(high, top)) + 1, t.mxl);
+  }
+  return ((2u << last) - 1) & ~((1u << first) - 1);
 }
 
-const u32* Gs::cached_level(const Texture& t, u32 level) {
+// Have a current state, with the levels a primitive needs found. A level is
+// decoded now, from memory as it is, so what is still to be drawn there is
+// drawn first. A large one in a format a frame can have is cheaper read in
+// place: that is a frame buffer read as a texture, new every time.
+void Gs::prepare_levels(u32 need) {
+  for (;;) {
+    ensure_env();
+    Env& e = *env_;
+    u32 missing = need & ~e.looked_at;
+    if (!missing) {
+      break;
+    }
+    Texture& t = e.tex;
+    u32 level = static_cast<u32>(std::countr_zero(missing)), bit = 1u << level;
+    u32 w = std::max(1u, (1u << t.tw) >> level), h = std::max(1u, (1u << t.th) >> level);
+    Pages& pages = e.level_pages[level];
+    pages.clear();
+    add_pages(pages, t.psm, t.tbp[level], t.tbw[level], 0, 0, static_cast<s32>(w) - 1, static_cast<s32>(h) - 1);
+    if (w * h <= (t.kind >= kTex8 ? 512u * 512u : 256u * 256u)) {
+      if (pages.intersects(pending_write_)) {
+        flush();  // and start again with the state's copy in the next batch
+        continue;
+      }
+      if (pages.intersects(inflight_write_)) {
+        wait_for_drawing();
+      }
+      batch_->textures.push_back(cached_level(t, level));
+      t.decoded[level] = batch_->textures.back()->data();
+    } else {
+      e.in_place |= bit;
+    }
+    e.looked_at |= bit;
+  }
+  Env& e = *env_;
+  if (need != e.last_need) {
+    e.last_need = need;
+    e.decoded_pages.clear();
+    e.in_place_pages.clear();
+    for (u32 level = 0; level < 7; level++) {
+      if (need & (1u << level)) {
+        (e.in_place & (1u << level) ? e.in_place_pages : e.decoded_pages).add(e.level_pages[level]);
+      }
+    }
+  }
+}
+
+// The pages a primitive reads of a level it reads in place, when its
+// coordinates say so plainly: texel coordinates (UV), the first level only.
+// A texture declared larger than what was drawn into it (a 512 by 448 frame
+// read as 1,024 by 1,024) then counts for the part that is read. False: the
+// whole level counts.
+bool Gs::in_place_reach(const Env& e, unsigned count, u32 need, Pages& pages) const {
+  const Texture& t = e.tex;
+  if (!e.fst || need != 1) {
+    return false;
+  }
+  s32 u0 = INT_MAX, v0 = INT_MAX, u1 = INT_MIN, v1 = INT_MIN;
+  for (unsigned n = 0; n < count; n++) {
+    s32 u = queue_[n].u >> 4, v = queue_[n].v >> 4;
+    u0 = std::min(u0, u);
+    v0 = std::min(v0, v);
+    u1 = std::max(u1, u);
+    v1 = std::max(v1, v);
+  }
+  // A texel either side for filtering; then where those fall in the level.
+  struct Span {
+    s32 from[2], to[2];
+    int count;
+  };
+  auto spans = [](s32 a, s32 b, s32 size, u32 mode, Span& out) {
+    a -= 1;
+    b += 1;
+    if (mode == 1) {
+      out = {{std::clamp(a, 0, size - 1), 0}, {std::clamp(b, 0, size - 1), 0}, 1};
+    } else if (mode != 0) {
+      return false;  // a region inside the texture: leave it to the caller
+    } else if (b - a + 1 >= size) {
+      out = {{0, 0}, {size - 1, 0}, 1};
+    } else if (a < 0) {
+      out = {{0, a + size}, {b, size - 1}, 2};
+    } else if (b >= size) {
+      out = {{a, 0}, {size - 1, b - size}, 2};
+    } else {
+      out = {{a, 0}, {b, 0}, 1};
+    }
+    return true;
+  };
+  Span across, down;
+  if (!spans(u0, u1, 1 << t.tw, t.wms, across) || !spans(v0, v1, 1 << t.th, t.wmt, down)) {
+    return false;
+  }
+  for (int i = 0; i < across.count; i++) {
+    for (int j = 0; j < down.count; j++) {
+      add_pages(pages, t.psm, t.tbp[0], t.tbw[0], across.from[i], down.from[j], across.to[i], down.to[j]);
+    }
+  }
+  return true;
+}
+
+std::shared_ptr<std::vector<u32>> Gs::cached_level(const Texture& t, u32 level) {
   u32 wl = t.tw > level ? t.tw - level : 0, hl = t.th > level ? t.th - level : 0;
   TextureKey key;
   key.place = t.tbp[level] | (static_cast<u64>(t.tbw[level]) << 14) | (static_cast<u64>(t.psm) << 20) | (static_cast<u64>(wl) << 26) |
@@ -823,11 +1176,16 @@ const u32* Gs::cached_level(const Texture& t, u32 level) {
       break;
     case kTex8:
     case kTex8H: {
-      u64 h = 0xCBF29CE484222325ull;
-      for (u32 i = 0; i < 256; i++) {
-        h = (h ^ t.clut[i]) * 0x100000001B3ull;
+      ClutCopy& copy = *t.clut_source;
+      if (!copy.hashed) {
+        u64 h = 0xCBF29CE484222325ull;
+        for (u32 i = 0; i < 256; i++) {
+          h = (h ^ copy.colours[i]) * 0x100000001B3ull;
+        }
+        copy.hash = h;
+        copy.hashed = true;
       }
-      key.colours = h;
+      key.colours = copy.hash;
       break;
     }
     default: {
@@ -852,14 +1210,10 @@ const u32* Gs::cached_level(const Texture& t, u32 level) {
       }
     }
     if (fresh) {
-      return c.texels->data();
+      return c.texels;
     }
-    retired_.push_back(c.texels);  // a waiting primitive may still be reading it
   } else if (texture_cache_.size() > 4096) {
-    for (auto& entry : texture_cache_) {
-      retired_.push_back(entry.second.texels);
-    }
-    texture_cache_.clear();
+    texture_cache_.clear();  // (the batches that use a copy hold on to it)
   }
 
   CachedTexture& c = texture_cache_[key];
@@ -878,7 +1232,7 @@ const u32* Gs::cached_level(const Texture& t, u32 level) {
   c.pages.clear();
   add_pages(c.pages, t.psm, t.tbp[level], t.tbw[level], 0, 0, static_cast<s32>(w) - 1, static_cast<s32>(h) - 1);
   c.stamp = clock_;
-  return c.texels->data();
+  return c.texels;
 }
 
 // --- rasterisers -----------------------------------------------------------
@@ -1170,10 +1524,7 @@ u32 Gs::texel(const Texture& t, u32 level, s32 iu, s32 iv, const u32* decoded) c
 }
 
 u32 Gs::sample_level(const Texture& t, u32 level, float u, float v, bool linear) const {
-  if (!(t.levels->looked_up.load(std::memory_order_acquire) & (1u << level))) {
-    resolve_level(t, level);
-  }
-  const u32* decoded = t.levels->cached[level].load(std::memory_order_relaxed);
+  const u32* decoded = t.decoded[level];
   if (level) {
     float scale = 1.0f / static_cast<float>(1u << level);
     u *= scale;
@@ -1261,6 +1612,11 @@ u32 Gs::shade(const Env& e, u32 rgba, float u, float v, float lod, u32 fog) cons
 // written, as the CLD field says. Later changes to the memory the table came
 // from do not reach a primitive until the table is loaded again.
 
+// A write to TEX0 or TEX2 can ask for the colour table to be loaded from
+// memory. The load is put off until the table is used (or the memory it
+// comes from is about to change), because a game also sets textures it then
+// draws nothing with, with addresses that point anywhere, and reading memory
+// means waiting for whatever is still to be drawn there.
 void Gs::load_clut(u64 tex0) {
   u32 psm = static_cast<u32>(bits(tex0, 20, 6));
   u32 cbp = static_cast<u32>(bits(tex0, 37, 14));
@@ -1269,6 +1625,11 @@ void Gs::load_clut(u64 tex0) {
   u32 csa = static_cast<u32>(bits(tex0, 56, 5));
   u32 cld = static_cast<u32>(bits(tex0, 61, 3));
 
+  // Only a texture format that uses the table loads it (and only then is
+  // the address remembered for the "if it changed" kinds of load).
+  if ((psm & 7) < 3) {
+    return;
+  }
   switch (cld) {
     case 1:
       break;
@@ -1287,35 +1648,45 @@ void Gs::load_clut(u64 tex0) {
       return;
   }
 
-  // The table is read from memory: draw what is waiting to be drawn there.
-  {
-    Pages source;
-    if (csm2) {
-      add_pages(source, PSMCT16, cbp, static_cast<u32>(bits(reg_[TEXCLUT], 0, 6)), 0, 0, 1023, 1023);
-    } else {
-      add_pages(source, cpsm, cbp, 1, 0, 0, 15, 15);
-    }
-    if (source.intersects(pending_write_)) {
-      flush();
-    }
-  }
-
-  u32 entries;
-  if (psm == PSMT8 || psm == PSMT8H) {
-    entries = 256;
-  } else if (psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH) {
-    entries = 16;
+  ClutLoad load;
+  load.waiting = true;
+  load.tex0 = tex0;
+  load.texclut = reg_[TEXCLUT];
+  load.count = (psm == PSMT8 || psm == PSMT8H) ? 256 : 16;
+  load.first = (csa * 16) & 0xFF;
+  if (csm2) {
+    add_pages(load.source, PSMCT16, cbp, static_cast<u32>(bits(load.texclut, 0, 6)), 0, 0, 1023, 1023);
   } else {
+    add_pages(load.source, cpsm, cbp, 1, 0, 0, 15, 15);
+  }
+  // One still waiting is done first, unless this one replaces all it would load.
+  if (clut_load_.waiting && !(load.first <= clut_load_.first && load.first + load.count >= clut_load_.first + clut_load_.count)) {
+    do_clut_load();
+  }
+  clut_load_ = load;
+}
+
+void Gs::do_clut_load() {
+  if (!clut_load_.waiting) {
     return;
   }
+  clut_load_.waiting = false;
+  const ClutLoad load = clut_load_;
+  u64 tex0 = load.tex0;
+  u32 cbp = static_cast<u32>(bits(tex0, 37, 14));
+  u32 cpsm = static_cast<u32>(bits(tex0, 51, 4));
+  bool csm2 = bits(tex0, 55, 1) != 0;
+  u32 csa = static_cast<u32>(bits(tex0, 56, 5));
 
-  for (u32 i = 0; i < entries; i++) {
+  // The table is read from memory: what is still to be drawn there comes first.
+  before_read(load.source);
+
+  for (u32 i = 0; i < load.count; i++) {
     u32 raw;
     if (csm2) {
-      u64 texclut = reg_[TEXCLUT];
-      u32 x = static_cast<u32>(bits(texclut, 6, 6)) * 16 + i;
-      raw = memory.read(PSMCT16, cbp, static_cast<u32>(bits(texclut, 0, 6)), x, static_cast<u32>(bits(texclut, 12, 10)));
-    } else if (entries == 256) {
+      u32 x = static_cast<u32>(bits(load.texclut, 6, 6)) * 16 + i;
+      raw = memory.read(PSMCT16, cbp, static_cast<u32>(bits(load.texclut, 0, 6)), x, static_cast<u32>(bits(load.texclut, 12, 10)));
+    } else if (load.count == 256) {
       // Entries 8-15 and 16-23 of every 32 are stored the other way round.
       u32 p = (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1);
       raw = memory.read(cpsm, cbp, 1, p & 15, p >> 4);
@@ -1477,11 +1848,9 @@ void Gs::start_transfer() {
     in_pages_.clear();
     add_pages(in_pages_, static_cast<u32>(bits(to, 56, 6)), static_cast<u32>(bits(to, 32, 14)), static_cast<u32>(bits(to, 48, 6)), x, y,
               x + static_cast<s32>(width) - 1, y + static_cast<s32>(height) - 1);
-    if (in_pages_.intersects(pending_write_)) {
-      flush();
-    }
+    before_read(in_pages_);
   } else if (dir == 1) {
-    flush();
+    finish();
     // Local to host: produce the whole image now, hand it out as it is asked for.
     u64 buffer = reg_[BITBLTBUF], position = reg_[TRXPOS];
     u32 bp = static_cast<u32>(bits(buffer, 0, 14)), bw = static_cast<u32>(bits(buffer, 16, 6));
@@ -1528,10 +1897,9 @@ void Gs::transfer_in(const u8* data, std::size_t bytes) {
     if (memory.read(psm, bp, bw, x, y) != (value & (bpp == 32 ? 0xFFFFFFFFu : (1u << bpp) - 1))) {
       if (!in_.changed) {
         in_.changed = true;
-        if (in_pages_.intersects(pending_read_)) {
-          flush();  // waiting primitives read this memory as it was
-        }
+        before_write(in_pages_);  // what is still to be drawn reads or writes this memory as it was
         stamp(in_pages_);
+        env_dirty_ = true;  // a texture there is to be looked at again
       }
       memory.write(psm, bp, bw, x, y, value);
     }
@@ -1598,9 +1966,10 @@ void Gs::copy_local() {
   if (width == 0 || height == 0) {
     return;
   }
-  flush();
+  finish();
   Pages to;
   add_pages(to, dpsm, dbp, dbw, static_cast<s32>(dx), static_cast<s32>(dy), static_cast<s32>(dx + width) - 1, static_cast<s32>(dy + height) - 1);
+  before_write(to);
   stamp(to);
   for (u32 j = 0; j < height; j++) {
     u32 y = (order & 1) ? height - 1 - j : j;
@@ -1615,7 +1984,8 @@ void Gs::copy_local() {
 // --- output ------------------------------------------------------------------
 
 Image Gs::snapshot(u32 bp, u32 bw, u32 psm, int width, int height) {
-  flush();
+  fp::want_nearest();
+  finish();
   Image image;
   image.width = width;
   image.height = height;
@@ -1632,36 +2002,83 @@ Image Gs::snapshot(u32 bp, u32 bw, u32 psm, int width, int height) {
   return image;
 }
 
-bool Gs::display(Image& out) {
-  flush();
+// What the display circuits are set to show now.
+Gs::Shown Gs::shown() const {
+  Shown what;
   u64 pmode = priv_[0];
   int circuit = (pmode & 1) ? 0 : (pmode & 2) ? 1 : -1;
   if (circuit < 0) {
-    return false;
+    return what;
   }
   u64 fb = priv_[circuit == 0 ? 0x7 : 0x9], disp = priv_[circuit == 0 ? 0x8 : 0xA];
-  u32 bp = static_cast<u32>(bits(fb, 0, 9)) * 32, bw = static_cast<u32>(bits(fb, 9, 6));
-  u32 psm = static_cast<u32>(bits(fb, 15, 5));
-  u32 dbx = static_cast<u32>(bits(fb, 32, 11)), dby = static_cast<u32>(bits(fb, 43, 11));
-  int width = static_cast<int>((bits(disp, 32, 12) + 1) / (bits(disp, 23, 4) + 1));
-  int height = static_cast<int>((bits(disp, 44, 11) + 1) / (bits(disp, 27, 2) + 1));
-  if (bw == 0 || width <= 0 || height <= 0) {
-    return false;
+  what.bp = static_cast<u32>(bits(fb, 0, 9)) * 32;
+  what.bw = static_cast<u32>(bits(fb, 9, 6));
+  what.psm = static_cast<u32>(bits(fb, 15, 5));
+  what.x = static_cast<u32>(bits(fb, 32, 11));
+  what.y = static_cast<u32>(bits(fb, 43, 11));
+  what.width = static_cast<int>((bits(disp, 32, 12) + 1) / (bits(disp, 23, 4) + 1));
+  what.height = static_cast<int>((bits(disp, 44, 11) + 1) / (bits(disp, 27, 2) + 1));
+  if (what.bw == 0 || what.width <= 0 || what.height <= 0) {
+    return what;
   }
-  width = std::min(width, static_cast<int>(bw * 64));
+  what.width = std::min(what.width, static_cast<int>(what.bw * 64));
+  what.on = true;
+  return what;
+}
+
+void Gs::copy_shown(const Shown& what, Image& out) const {
+  int width = what.width, height = what.height;
   out.width = width;
   out.height = height;
   out.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
-      u32 v = memory.read(psm, bp, bw, (dbx + static_cast<u32>(x)) & 2047, (dby + static_cast<u32>(y)) & 2047);
-      if (is16(psm)) {
+      u32 v = memory.read(what.psm, what.bp, what.bw, (what.x + static_cast<u32>(x)) & 2047, (what.y + static_cast<u32>(y)) & 2047);
+      if (is16(what.psm)) {
         v = pack((v & 0x1F) << 3, ((v >> 5) & 0x1F) << 3, ((v >> 10) & 0x1F) << 3, 0);
       }
       out.pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] = v | kA;
     }
   }
-  return true;
+}
+
+bool Gs::display(Image& out) {
+  fp::want_nearest();
+  finish();
+  Shown what = shown();
+  if (what.on) {
+    copy_shown(what, out);
+  }
+  return what.on;
+}
+
+void Gs::display_later(Image&& buffer, std::function<void(bool shown, Image& picture)> done) {
+  fp::want_nearest();
+  Shown what = shown();
+  flush();
+  if (!raster_) {
+    if (what.on) {
+      copy_shown(what, buffer);
+    }
+    done(what.on, buffer);
+    return;
+  }
+  // In its place in the order of the batches; the pages it reads count as
+  // read in place by a batch on its way.
+  if (what.on) {
+    add_pages(inflight_read_, what.psm, what.bp, what.bw, static_cast<s32>(what.x), static_cast<s32>(what.y),
+              static_cast<s32>(what.x) + what.width - 1, static_cast<s32>(what.y) + what.height - 1);
+  }
+  auto picture = std::make_shared<Image>(std::move(buffer));
+  batch_->task = [this, what, picture, done = std::move(done)] {
+    if (what.on) {
+      copy_shown(what, *picture);
+    }
+    done(what.on, *picture);
+  };
+  batch_ = raster_->give(std::move(batch_));
+  env_ = nullptr;
+  env_dirty_ = clut_copy_dirty_ = true;
 }
 
 }  // namespace ps2

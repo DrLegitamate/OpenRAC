@@ -102,23 +102,64 @@ void add_library_services(Machine& machine) {
 
     // What a silent server answers. Streams and sounds get handles and are
     // "buffered" at once; nothing is ever still playing.
+    // What the sound server answers. The streams (music, speech) are
+    // played; sounds from the banks get a handle and are over at once.
     auto command = [&m](u32 number, u32 data) -> u32 {
-      (void)data;
       switch (number) {
         case 0x11: case 0x21:  // play a sound
-        case 0x2C:             // play a stream from the disc
           return m.sound_next_handle++;
+        case 0x09:  // the volume of a group of sounds (group, volume)
+          m.sound.set_group_volume(m.ee.read32(data), static_cast<int>(m.ee.read32(data + 4)));
+          return 0;
+        case 0x2C: {
+          // Play a stream from the disc: (sector, a second sector, volume
+          // above an offset, pan above an offset, group, the stream to
+          // follow, flags). Flag 4: repeat. The answer is the handle, or
+          // that of the stream it follows.
+          u32 sector = m.ee.read32(data), after = m.ee.read32(data + 20), flags = m.ee.read32(data + 24);
+          int volume = static_cast<int>(m.ee.read32(data + 8) >> 16);
+          u32 group = m.ee.read32(data + 16);
+          if (after && m.sound.playing(after)) {
+            return m.sound.play(after, sector, volume, group, (flags & 4) != 0, after) ? after : 0;
+          }
+          u32 handle = m.sound_next_handle++;
+          return m.sound.play(handle, sector, volume, group, (flags & 4) != 0, 0) ? handle : 0;
+        }
+        case 0x2D:  // pause a stream
+          m.sound.pause(m.ee.read32(data), true);
+          return 0;
+        case 0x2E:  // and go on
+          m.sound.pause(m.ee.read32(data), false);
+          return 0;
+        case 0x15:  // stop a sound, or a stream
+          m.sound.stop(m.ee.read32(data));
+          return 0;
+        case 0x34:  // stop every stream
+          m.sound.stop_all();
+          return 0;
         case 0x4F:  // is the stream buffered?
           return 1;
-        case 0x19:  // is the sound still playing?
+        case 0x19: {  // is it still playing? Its handle if so.
+          u32 handle = m.ee.read32(data);
+          return m.sound.playing(handle) ? handle : 0;
+        }
         case 0x32:  // time left in the stream
+          return m.sound.remaining(m.ee.read32(data));
         default:
           return 0;
       }
     };
 
     if (size == 4) {
-      m.log(2, "sound loader call %x", function);
+      if (m.verbose >= 2) {
+        std::string words;
+        for (u32 w = 0; w < m.arg(4) && w < 40; w += 4) {
+          char text[12];
+          std::snprintf(text, sizeof(text), " %08x", m.ee.read32(send + w));
+          words += text;
+        }
+        m.log(2, "sound loader call %x (%u bytes):%s", function, m.arg(4), words.c_str());
+      }
       m.ee.write32(receive, m.sound_next_handle++ << 16);
     } else if (size >= 8) {
       m.ee.write32(receive, 0xFFFFFFFFu);
@@ -128,7 +169,15 @@ void add_library_services(Machine& machine) {
         for (u32 n = 0; n < count && n < results; n++) {
           u32 number = m.ee.read16(at), bytes = m.ee.read16(at + 2);
           u32 answer = command(number, at + 4);
-          m.log(2, "sound command %02x (%u bytes) -> %x", number, bytes, answer);
+          if (m.verbose >= 2) {
+            std::string words;
+            for (u32 w = 0; w < bytes && w < 40; w += 4) {
+              char text[12];
+              std::snprintf(text, sizeof(text), " %08x", m.ee.read32(at + 4 + w));
+              words += text;
+            }
+            m.log(2, "sound command %02x (%u bytes):%s -> %x", number, bytes, words.c_str(), answer);
+          }
           m.ee.write32(receive + 4 + n * 4, answer);
           at += (4 + bytes + 3) & ~3u;
         }
@@ -147,39 +196,8 @@ void add_library_services(Machine& machine) {
     m.result(0);
   });
 
-  // --- the memory card: no card in the slot, for now ---
-  // Every function is accepted and "finishes" at the next sceMcSync, with
-  // the result a console gives when the slot is empty.
-  for (const auto& [name, function] : std::initializer_list<std::pair<const char*, int>>{
-           {"sceMcGetInfo", 1}, {"sceMcOpen", 2}, {"sceMcClose", 3}, {"sceMcSeek", 4}, {"sceMcRead", 5},
-           {"sceMcWrite", 6}, {"sceMcMkdir", 11}, {"sceMcGetDir", 13}, {"sceMcDelete", 15}, {"sceMcFormat", 16},
-           {"sceMcUnformat", 17}}) {
-    machine.add_service(name, [function](Machine& m) {
-      if (function == 1) {
-        // (port, slot, type, free, format): type 0 is "nothing there".
-        for (unsigned n = 2; n < 5; n++) {
-          if (m.arg(n)) {
-            m.ee.write32(m.arg(n), 0);
-          }
-        }
-      }
-      m.mc_function = function;
-      m.mc_result = -10;  // no card
-      m.result(0);
-    });
-  }
-  machine.add_service("sceMcInit", [](Machine& m) { m.result(0); });
-  // sceMcSync(mode, function, result): 1 when the last function has finished.
-  machine.add_service("sceMcSync", [](Machine& m) {
-    if (m.mc_function == 0) {
-      m.result(static_cast<u64>(-1));
-      return;
-    }
-    if (m.arg(1)) m.ee.write32(m.arg(1), static_cast<u32>(m.mc_function));
-    if (m.arg(2)) m.ee.write32(m.arg(2), static_cast<u32>(m.mc_result));
-    m.mc_function = 0;
-    m.result(1);
-  });
+  // --- the memory card ---
+  add_memory_card_services(machine);
 
   // --- the pad ---
   machine.add_service("scePad2GetState", [](Machine& m) { m.result(1); });  // connected and stable

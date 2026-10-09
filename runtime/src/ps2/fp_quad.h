@@ -26,7 +26,7 @@
 // false and the caller computes the instruction with fp.h instead.
 //
 // The caller must have set the host's rounding to "towards zero"
-// (QuadRounding does it for a scope).
+// (want_toward_zero).
 namespace ps2::fp {
 
 // The host's rounding mode, read and set directly where the C library's way
@@ -36,11 +36,37 @@ inline u64 host_rounding() { return __builtin_arm_rsr64("FPCR"); }
 inline void set_host_rounding(u64 saved) { __builtin_arm_wsr64("FPCR", saved); }
 inline void round_toward_zero() { __builtin_arm_wsr64("FPCR", __builtin_arm_rsr64("FPCR") | (u64{3} << 22)); }
 inline void round_to_nearest() { __builtin_arm_wsr64("FPCR", __builtin_arm_rsr64("FPCR") & ~(u64{3} << 22)); }
+// Changing the mode is slow and reading it is not, so code that needs one
+// mode asks for it on entry and nobody switches back: the vector units ask
+// for "towards zero", whatever computes as the host does (the GS, the
+// program around the machine) asks for "to nearest".
+inline void want_toward_zero() {
+  u64 mode = __builtin_arm_rsr64("FPCR");
+  if ((mode & (u64{3} << 22)) != (u64{3} << 22)) {
+    __builtin_arm_wsr64("FPCR", mode | (u64{3} << 22));
+  }
+}
+inline void want_nearest() {
+  u64 mode = __builtin_arm_rsr64("FPCR");
+  if (mode & (u64{3} << 22)) {
+    __builtin_arm_wsr64("FPCR", mode & ~(u64{3} << 22));
+  }
+}
 #else
 inline u64 host_rounding() { return static_cast<u64>(std::fegetround()); }
 inline void set_host_rounding(u64 saved) { std::fesetround(static_cast<int>(saved)); }
 inline void round_toward_zero() { std::fesetround(FE_TOWARDZERO); }
 inline void round_to_nearest() { std::fesetround(FE_TONEAREST); }
+inline void want_toward_zero() {
+  if (std::fegetround() != FE_TOWARDZERO) {
+    std::fesetround(FE_TOWARDZERO);
+  }
+}
+inline void want_nearest() {
+  if (std::fegetround() != FE_TONEAREST) {
+    std::fesetround(FE_TONEAREST);
+  }
+}
 #endif
 
 #if OPENRAC_FP_QUAD
@@ -122,8 +148,20 @@ inline bool quad_add(const u32* a, const u32* b, u32 dest, u32* out, bool subtra
   return true;
 }
 
+// to = from in the fields of `dest`.
+inline void quad_merge(u32* to, const u32* from, u32 dest) {
+  vst1q_u32(to, vbslq_u32(quad_detail::fields(dest), vld1q_u32(from), vld1q_u32(to)));
+}
+
 #else
 
+inline void quad_merge(u32* to, const u32* from, u32 dest) {
+  for (unsigned field = 0; field < 4; field++) {
+    if (dest & (8u >> field)) {
+      to[field] = from[field];
+    }
+  }
+}
 inline bool quad_mul(const u32*, const u32*, u32, u32*) { return false; }
 inline bool quad_add(const u32*, const u32*, u32, u32*, bool = false) { return false; }
 

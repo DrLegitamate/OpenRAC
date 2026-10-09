@@ -4,6 +4,9 @@
 
 #include <array>
 #include <functional>
+#include <unordered_map>
+#include <memory>
+#include <utility>
 #include <vector>
 
 #include "types.h"
@@ -17,7 +20,8 @@ namespace ps2 {
 // cycles later, and an instruction that needs it sooner waits; flags appear
 // four cycles after the instruction that set them; Q and P arrive when their
 // dividers and function units finish; a branch tests the value an integer
-// register had before the instruction just ahead of it; XGKICK sends its
+// register had before the instruction just ahead of it, unless that
+// instruction read flags into it or the branch had to wait; XGKICK sends its
 // packet one instruction late. Arithmetic is the
 // console's own (fp.h), on raw bit patterns.
 class Vu {
@@ -42,9 +46,13 @@ class Vu {
   bool stopped() const { return !running_; }
 
   // Skip working out MAC and status flags that no instruction of the loaded
-  // programs can read. Safe for VU1, whose flags nothing outside it reads;
-  // VU0's can be read by the EE, so it leaves this off.
+  // programs can read. What a program leaves behind when it ends is always
+  // worked out. Safe for VU1, whose flags nothing outside it reads, and for
+  // VU0 as long as the EE reads no status flags (`status_was_read`).
   bool skip_unread_flags = false;
+  // Something outside read the status flags, whose remembering bits depend
+  // on every instruction: nothing is skipped from now on.
+  void status_was_read();
   // Program memory was written: forget what was worked out about it.
   void program_changed();
 
@@ -67,6 +75,8 @@ class Vu {
 
   // XGKICK: a GIF packet starts at this quadword of data memory.
   std::function<void(u32 quadword)> on_kick;
+  // For looking into a program: called before each pair runs.
+  std::function<void(u32 at, u32 upper, u32 lower)> on_step;
   // XTOP and XITOP read VIF registers.
   std::function<u32()> on_top, on_itop;
 
@@ -89,14 +99,27 @@ class Vu {
     u32 mac = 0, status = 0, clip = 0;
     u64 at = 0;  // the cycle from which instructions see them
   };
-  // What a pair reads that can make it wait, worked out once per pair.
+  // The function for one instruction (see vu.cpp, at the end).
+  using UpperRun = void (*)(Vu&, u32 code);
+  using LowerRun = void (*)(Vu&, u32 code, u32 at);
+  // What a pair reads that can make it wait, and how it is run, worked out
+  // once per pair.
   struct Needs {
+    UpperRun upper_run = nullptr;
+    LowerRun lower_run = nullptr;
     u32 up = 0, low = 0;
     bool known = false;
     u8 count = 0;
     u8 reg[4] = {0, 0, 0, 0}, mask[4] = {0, 0, 0, 0};
     u8 wait = 0;  // 1: the divider must be free, 2: the function unit must be done
     bool flags_wanted = true;  // something can read the flags its upper instruction sets
+    bool upper_nop = false, lower_nop = false;
+    // The lower instruction may read or write the float register the upper
+    // one writes, so the two have to be kept apart with care.
+    bool together = true;
+    // None of the three pairs before it in memory writes a float register it
+    // reads: coming to it in a straight line, it never waits for one.
+    bool no_wait = false;
   };
   enum class Op { Add, Sub, Mul, Madd, Msub };
   enum class From { Ft, Bc, Q, I };
@@ -106,8 +129,23 @@ class Vu {
   void lower(u32 code, u32 at);
   void upper_special(u32 code);
   void lower_special(u32 code);
+  void upper_body(u32 code, u32 fn);
+  void upper_special_body(u32 code, u32 fn);
+  void lower_body(u32 code, u32 at, u32 op);
+  void lower_special_body(u32 code, u32 fn, u32 index);
+  template <unsigned Slot>
+  static void upper_as(Vu& vu, u32 code);
+  template <unsigned Slot>
+  static void lower_as(Vu& vu, u32 code, u32 at);
+  template <std::size_t... N>
+  static constexpr std::array<UpperRun, sizeof...(N)> upper_runs(std::index_sequence<N...>);
+  template <std::size_t... N>
+  static constexpr std::array<LowerRun, sizeof...(N)> lower_runs(std::index_sequence<N...>);
+  static const std::array<UpperRun, 192> kUpperRuns;
+  static const std::array<LowerRun, 320> kLowerRuns;
 
-  void arith(u32 code, Op op, From from, bool to_acc);
+  template <Op op, From from, bool to_acc>
+  void arith(u32 code);
   void min_max(u32 code, From from, bool max);
   u32 operand(u32 code, From from, unsigned field) const;
   u32 result(u32 value, u32 problems, unsigned field, u32& flags) const;
@@ -118,11 +156,14 @@ class Vu {
   void fire_kick();
 
   void write_vf(unsigned reg, u32 mask, const std::array<u32, 4>& value);
+  void about_to_write_vf(unsigned reg, u32 mask);
   void write_vi(unsigned reg, u16 value);
+  void write_vi_from_flags(unsigned reg, u16 value);
   u16 branch_vi(unsigned reg) const;
   void branch(u32 target);
   void start_q(u32 value, unsigned latency, u32 divide_flags);
   void work_out(Needs& needs, u32 up, u32 low) const;
+  bool never_waits(const Needs& needs, u32 at) const;
   bool flags_can_be_read(u32 at) const;
   void look_at_programs();
   void start_p(double value, unsigned latency);
@@ -143,8 +184,21 @@ class Vu {
   bool timed_ = false;  // a microprogram is running (the EE's own instructions are not timed)
   // The cycle from which each field of each float register can be read.
   std::array<std::array<u64, 4>, 32> readable_{};
-  std::vector<Needs> needs_;
-  bool programs_looked_at_ = false, sticky_readers_ = true;
+  std::array<u64, 32> register_ready_{};  // the latest of a register's four
+  // What has been worked out about the pairs of program memory, kept for
+  // each content the memory has had: the games swap a few programs in and
+  // out all the time, and each comes back as it was.
+  struct Image {
+    std::vector<u8> micro;
+    std::vector<Needs> needs;
+    bool looked_at = false, sticky_readers = true;
+  };
+  std::unordered_map<u64, std::unique_ptr<Image>> images_;
+  Image* image_ = nullptr;
+  Needs* needs_ = nullptr;       // of the image in use
+  bool program_dirty_ = true;    // program memory may differ from the image in use
+  bool sticky_readers_ = true;   // of the image in use
+  void choose_image();
   bool flags_wanted_ = true;  // for the instruction being run
 
   std::array<Flags, 8> flag_pipe_{};
@@ -155,6 +209,7 @@ class Vu {
   u64 q_at_ = 0, p_at_ = 0;  // the cycle the result arrives, 0 when none is on its way
 
   unsigned branch_in_ = 0, stop_in_ = 0, kick_in_ = 0;
+  u64 straight_ = 0;  // pairs run since the program was started or a branch was taken
   u32 branch_target_ = 0, kick_address_ = 0;
 
   unsigned backup_reg_ = 0, backup_ttl_ = 0;

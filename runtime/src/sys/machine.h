@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <string>
@@ -10,10 +11,12 @@
 #include <vector>
 
 #include "disc.h"
+#include "drawing.h"
 #include "ps2/dma.h"
 #include "ps2/ee.h"
 #include "ps2/graphics.h"
 #include "ps2/memory.h"
+#include "sound.h"
 
 namespace sys {
 
@@ -44,23 +47,32 @@ class Machine {
   // --- the parts ---
   ps2::GuestMemory memory;
   ps2::Graphics graphics;  // VIF1, VU1, GIF, GS
+  // How the machine reaches them: in order, and on a thread of their own
+  // once `drawing.start()` has been called. Reading `graphics` directly is
+  // for after `drawing.sync()`.
+  Drawing drawing{graphics};
   ps2::Gif unused_gif{graphics.gs};
   ps2::Vif1 vif0{unused_gif};
   ps2::Vu vu0{ps2::Vu::Memory{vif0.micro.data(), 4096, vif0.data.data(), 4096}};
   ps2::Ee ee{memory, vu0};
   Disc disc;
+  Sound sound{disc};
 
   // --- starting ---
   // Load the program the disc boots (SYSTEM.CNF's BOOT2) and get ready to
   // run it. `hz` is the display's field rate.
   bool boot(std::string* error = nullptr);
   double hz = 50.0;
+  std::string program_name;  // the program's file on the disc, which is the disc's code (SCES_509.16)
 
   // --- running ---
   // Run until the next vertical blank has been announced to the program.
   void run_frame();
   // Called at each vertical blank, after the game's handlers: show a frame.
   std::function<void()> on_vblank;
+  // Called at each vertical blank with that field's sound: pairs of left
+  // and right at Sound::kRate.
+  std::function<void(const ps2::s16* samples, std::size_t frames)> on_sound;
   bool halted = false;
   u64 frames = 0;
 
@@ -95,6 +107,15 @@ class Machine {
   void cd_read_finished() { cd_callback_at_ = ee.cycles + 200000; update_event(); }
   // The silent sound server's next handle for a bank, stream or sound.
   u32 sound_next_handle = 0x100;
+  // The memory card in the first slot: a directory of the host (none when
+  // the name is empty), the files the program has open on it, and whether
+  // the program has been told of it yet.
+  struct Card {
+    std::string directory;
+    std::unordered_map<int, std::FILE*> open;
+    bool seen = false;
+    ~Card();
+  } card;
   // The memory card library's "last function and its result".
   int mc_function = 0, mc_result = 0;
 
@@ -159,11 +180,15 @@ class Machine {
   u32 stack_top_ = ps2::GuestMemory::kRamBytes;
   u64 last_reported_unknown_ = 0;
   u64 cd_callback_at_ = ~u64{0};
+  std::vector<ps2::s16> sound_out_;
+  double sound_owed_ = 0;  // frames of sound not yet made, in fractions
   void update_event();
 };
 
 // Services every game shares, registered by `add_default_services` and
 // defined in services.cpp.
 void add_library_services(Machine& machine);
+// The memory card library (memcard.cpp).
+void add_memory_card_services(Machine& machine);
 
 }  // namespace sys
