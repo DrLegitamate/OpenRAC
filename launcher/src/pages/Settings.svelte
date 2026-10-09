@@ -26,7 +26,6 @@
       if (setup) {
         draft.root ??= d.roots[0]?.path ?? null;
         draft.python ??= d.pythons[0]?.path ?? null;
-        draft.pcsx2 ??= d.pcsx2s[0]?.path ?? null;
         draft.godot ??= d.godots[0]?.path ?? null;
         draft.docker ??= d.dockers[0]?.path ?? null;
       }
@@ -34,7 +33,7 @@
   });
 
   const changed = $derived(JSON.stringify(draft) !== JSON.stringify(app.config));
-  const tool = (t: "python" | "pcsx2" | "godot" | "docker") => (path: string) => api.checkTool(t, path);
+  const tool = (t: "python" | "godot" | "docker") => (path: string) => api.checkTool(t, path);
   const root = (path: string): Promise<Check> => api.checkRoot(path);
 
   async function save(finish: boolean) {
@@ -53,8 +52,8 @@
       <div>
         <h1>Welcome to OpenRAC</h1>
         <p class="muted">
-          The launcher sets up, builds and plays the Ratchet &amp; Clank decompilations in your OpenRAC folder, with
-          your own discs. Check what was found below; only the OpenRAC folder and Python are needed to start.
+          Play the Ratchet &amp; Clank games natively and edit their levels, with your own discs. The launcher could not
+          find everything it needs by itself: choose your OpenRAC folder below, and Python if none is shown.
         </p>
       </div>
     </section>
@@ -83,34 +82,45 @@
   <section class="panel">
     <h2>Programs</h2>
     <PathField
-      label="Python"
-      hint="Python 3.10 or newer: OpenRAC's tools and the level editor run with it."
-      bind:value={draft.python}
-      candidates={found?.pythons}
-      check={tool("python")}
-    />
-    <PathField
-      label="PCSX2"
-      hint="The PlayStation 2 emulator, to play your disc or a build. Optional."
-      bind:value={draft.pcsx2}
-      candidates={found?.pcsx2s}
-      check={tool("pcsx2")}
-    />
-    <PathField
-      label="Docker"
-      hint="The build container of Ratchet & Clank (PAL) and Deadlocked runs in it, on Linux and macOS. Optional."
-      bind:value={draft.docker}
-      candidates={found?.dockers}
-      check={tool("docker")}
-    />
-    <PathField
       label="Godot"
       hint="Godot 4 (4.7 or newer), to edit levels. Optional."
       bind:value={draft.godot}
       candidates={found?.godots}
       check={tool("godot")}
     />
+    <!-- A player is asked for Python only when none was found; contributors always see it. -->
+    {#if draft.developer || setup || !app.config?.python}
+      <PathField
+        label="Python"
+        hint="Python 3.10 or newer: OpenRAC's tools and the level editor run with it."
+        bind:value={draft.python}
+        candidates={found?.pythons}
+        check={tool("python")}
+      />
+    {/if}
+    {#if draft.developer}
+      <PathField
+        label="Docker"
+        hint="The build container of Ratchet & Clank (PAL) and Deadlocked runs in it, on Linux and macOS. Optional."
+        bind:value={draft.docker}
+        candidates={found?.dockers}
+        check={tool("docker")}
+      />
+    {/if}
   </section>
+
+  {#if !setup}
+    <section class="panel">
+      <h2>Developer tools</h2>
+      <label class="switch">
+        <input type="checkbox" bind:checked={draft.developer} />
+        <span>
+          Show what contributors use: each game's build, checks, toolchains and decompilation progress. Off, the
+          launcher shows a player's three steps: add your disc, play, edit levels.
+        </span>
+      </label>
+    </section>
+  {/if}
 
   <div class="row end">
     {#if app.info?.configFile}<span class="dim mono grow clip" title="Settings file">{app.info.configFile}</span>{/if}
@@ -157,6 +167,22 @@
 
   .note {
     font-size: 13px;
+  }
+
+  .switch {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    font-size: 14px;
+    color: var(--soft);
+    cursor: pointer;
+  }
+
+  .switch input {
+    margin-top: 3px;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--amber);
   }
 
   .link {
