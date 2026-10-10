@@ -76,8 +76,12 @@ struct Instance {
     // A live moby's joint palette: the first of its matrices in the scene's palette
     // (LevelScene::set_palette); -1 draws the mesh as stored (its bind pose).
     int palette = -1;
-    // A lit tie: the first of its 64 colours in LevelData::light_colours; -1 none.
+    // A lit tie or shrub: the first of its 64 (24) colours in LevelData::light_colours; -1 none.
     int lights = -1;
+    // A live moby lit as the game lights it: its light word (set 0, set 1, the cross-fade
+    // 0..1; w = 1 to light it) and its ambient colour (RGB bytes / 128).
+    std::array<float, 4> moby_light{0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> moby_ambient{0.5f, 0.5f, 0.5f, 1.0f};
 };
 
 // What the viewer draws, in the game's order.
@@ -106,8 +110,12 @@ struct LevelData {
     std::array<std::vector<Instance>, kLayerCount> instances;
     // Moby classes: model and whether it is the stand-in box, for placing live mobys.
     std::map<int, std::pair<std::uint32_t, bool>> moby_classes;
-    // The ties' lit colours, 64 per instance, RGBA bytes (0x80 = 1.0), from placements.json.
+    // The ties' and shrubs' lit colours, 64 or 24 per instance, RGBA bytes (0x80 = 1.0), from
+    // placements.json.
     std::vector<std::uint32_t> light_colours;
+    // The level's 16 directional light sets (manifest "lights"): per set colour A (w = back
+    // factor), direction A, colour B, direction B; empty when the export has none.
+    std::vector<float> light_sets;
     std::array<float, 3> background{0.0f, 0.0f, 0.0f};  // where no sky shell covers
     Vec3 bounds_min{};
     Vec3 bounds_max{};

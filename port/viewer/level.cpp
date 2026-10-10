@@ -351,6 +351,16 @@ bool load_level(const fs::path& dir, LevelData& out, std::string& error) {
         return load_model(dir / file.string(), out, error);
     };
 
+    for (const json::Value& set : manifest["lights"].items()) {
+        for (const json::Value& v : set.items()) {
+            for (const json::Value& x : v.items()) {
+                out.light_sets.push_back(static_cast<float>(x.number(0)));
+            }
+        }
+    }
+    if (out.light_sets.size() != 16 * 16) {
+        out.light_sets.clear();
+    }
     const json::Value& sky = manifest["sky"];
     if (sky.is_object()) {
         for (std::size_t i = 0; i < 3; ++i) {
@@ -451,7 +461,8 @@ bool load_level(const fs::path& dir, LevelData& out, std::string& error) {
             if (cls->second.box) {
                 instance.tint = class_colour(id);
             }
-            if (layer == Layer::Ties && p["colours"].items().size() == 64) {
+            const std::size_t lit = p["colours"].items().size();
+            if ((layer == Layer::Ties && lit == 64) || (layer == Layer::Shrubs && lit == 24)) {
                 instance.lights = static_cast<int>(out.light_colours.size());
                 for (const json::Value& c : p["colours"].items()) {
                     out.light_colours.push_back(static_cast<std::uint32_t>(c.number(0)));
