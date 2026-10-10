@@ -74,6 +74,7 @@ GifInterpreter::GifInterpreter(TexturePool& textures, DirectConfig config)
 }
 
 void GifInterpreter::clear() {
+    m_gif_pending.clear();
     m_targets.clear();
     m_vertices.clear();
     m_draws.clear();
@@ -93,7 +94,20 @@ const GifInterpreter::Context& GifInterpreter::context() const {
     return m_context[attributes().ctxt ? 1 : 0];
 }
 
-bool GifInterpreter::gif(std::span<const std::uint8_t> packet) {
+bool GifInterpreter::gif(std::span<const std::uint8_t> input) {
+    // A tag whose data the last packet did not finish goes on in this one: the GIF keeps its
+    // state between transfers (an image upload is often split over several VIF DIRECTs).
+    std::vector<std::uint8_t> joined;
+    std::span<const std::uint8_t> packet = input;
+    if (!m_gif_pending.empty()) {
+        joined.swap(m_gif_pending);
+        joined.insert(joined.end(), input.begin(), input.end());
+        packet = joined;
+    }
+    const auto carry = [&](std::size_t from) {
+        m_gif_pending.assign(packet.begin() + static_cast<std::ptrdiff_t>(from), packet.end());
+        return true;
+    };
     std::size_t at = 0;
     while (at + 16 <= packet.size()) {
         const gs::GifTag tag = gs::GifTag::decode(read64(packet, at), read64(packet, at + 8));
@@ -101,14 +115,12 @@ bool GifInterpreter::gif(std::span<const std::uint8_t> packet) {
         at += 16;
         switch (tag.flg) {
             case gs::GifTag::kPacked: {
-                if (tag.pre) {
-                    write_prim(tag.prim);
-                }
                 const std::size_t size = std::size_t{tag.nloop} * tag.nreg * 16;
                 if (at + size > packet.size()) {
-                    return fail(
-                        std::format("GIF tag at {:#x}: PACKED data runs past the packet", tag_at)
-                    );
+                    return carry(tag_at);
+                }
+                if (tag.pre) {
+                    write_prim(tag.prim);
                 }
                 for (std::uint32_t loop = 0; loop < tag.nloop; ++loop) {
                     for (std::uint32_t r = 0; r < tag.nreg; ++r) {
@@ -178,9 +190,7 @@ bool GifInterpreter::gif(std::span<const std::uint8_t> packet) {
                 const std::size_t words = std::size_t{tag.nloop} * tag.nreg;
                 const std::size_t size = ((words + 1) / 2) * 16;  // padded to whole quadwords
                 if (at + size > packet.size()) {
-                    return fail(
-                        std::format("GIF tag at {:#x}: REGLIST data runs past the packet", tag_at)
-                    );
+                    return carry(tag_at);
                 }
                 for (std::size_t i = 0; i < words; ++i) {
                     const auto reg =
@@ -199,9 +209,7 @@ bool GifInterpreter::gif(std::span<const std::uint8_t> packet) {
             case gs::GifTag::kDisable: {
                 const std::size_t size = std::size_t{tag.nloop} * 16;
                 if (at + size > packet.size()) {
-                    return fail(
-                        std::format("GIF tag at {:#x}: IMAGE data runs past the packet", tag_at)
-                    );
+                    return carry(tag_at);
                 }
                 image_data(packet.subspan(at, size));
                 at += size;
@@ -823,6 +831,14 @@ void GifInterpreter::emit_sprite(const GsVertex& a, const GsVertex& b) {
         if (scissor_height >= kFrameFillLines && height + 2 >= scissor_height) {
             return;
         }
+    }
+    // The copy of the finished draw buffer into the display buffer, in strips: stretched in the menus,
+    // 1:1 between borders in play. The picture already is that frame (both buffers map onto it by
+    // their sizes), so drawing the copy would only shrink it into the middle of itself.
+    if (attributes().tme && context().tex0.tbp0 == m_config.frame_blocks[1]
+        && context().frame.fbp * 32 == m_config.frame_blocks[0]
+        && std::llabs(static_cast<std::int64_t>(b.y) - static_cast<std::int64_t>(a.y)) / 16 >= kFrameFillLines) {
+        return;
     }
     // A sprite is a rectangle from two corners; depth, colour and fog come
     // from the second vertex. Texture coordinates go to S/Q, T/Q per corner

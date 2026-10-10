@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/log.h"
+#include "openrac/guest.h"
 #include "platform/input.h"
 #include "platform/window.h"
 #include "renderer/direct.h"
@@ -225,6 +226,8 @@ constexpr int kTitleWorld = 99;
 constexpr int kFlightWorld = 98;
 // The game mode word (0x15F6E8); 6 in the boot program is the flight between planets.
 constexpr std::uint32_t kGameMode = 0x0015F6E8;
+// The directional light bank, in the executable's terms (relocated to the loaded program's copy).
+constexpr gaddr kLightBank = 0x0019BEC0;
 
 // Uploads a level's geometry; while the boot program runs (the title and the main menu), the title
 // world's, or level 0's when the title world was not extracted.
@@ -461,6 +464,17 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
         g->world_camera.reset();
     }
 
+    // OPENRAC_DUMP_RAM=FRAME: the game's 32 MB of main memory at that frame, to ram_FRAME.bin.
+    static const char* dump_ram = std::getenv("OPENRAC_DUMP_RAM");
+    if (dump_ram != nullptr && g->index == std::strtoull(dump_ram, nullptr, 10)) {
+        const std::string path = std::format("ram_{}.bin", g->index);
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(ram.data(), 1, ram.size(), f);
+            std::fclose(f);
+            log::info("main memory written to {}", path);
+        }
+    }
+
     // OPENRAC_DEBUG: the game's state each 100 frames, for bring-up.
     static const bool debug = std::getenv("OPENRAC_DEBUG") != nullptr;
     if (debug && g->index % 100 == 0) {
@@ -570,6 +584,17 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
     g->moby_cameras.clear();
     g->scene.set_fog(state.fog_colour, state.fog_near, state.fog_far, state.fog_near_f,
                      state.fog_far_f);
+    // The light bank as the game holds it now (16 sets of 0x40 bytes; the executable's 0x19BEC0, each
+    // level's copy elsewhere): the level loader fills it from the gameplay file, and the game changes
+    // sets at run time (the page menus write set 14 for their frame mobys, fog zones the hero's).
+    {
+        const gaddr bank = openrac_relocate_data(kLightBank);
+        if (bank + 16 * 0x40 <= ram.size()) {
+            std::vector<float> sets(16 * 16);
+            std::memcpy(sets.data(), ram.data() + bank, sets.size() * sizeof(float));
+            g->scene.set_light_sets(sets);
+        }
+    }
     if (!g->level.models.empty()) {
         g->scene.set_palette(palette);
         g->scene.set_instances(viewer::Layer::Mobys, live);
