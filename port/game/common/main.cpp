@@ -6,6 +6,7 @@
 // (openrac_game, generated from port/game/<id>/hostgen.json).
 //
 //   openrac-<id> --data <install>/active/<game>/data [--cards DIR] [--frames N] [--keep-going]
+//                [--level N]
 //
 // The data folder is what the extractor made from the player's disc
 // (tools/extractor.py; the launcher's "Set up from your disc"). The program
@@ -56,6 +57,7 @@ const char* openrac_game_disc_image = nullptr;
 const char* openrac_game_card_dir = nullptr;
 int openrac_game_language = 1;
 int openrac_game_no_card = 0;
+int openrac_game_start_level = -1;
 }
 
 namespace {
@@ -86,7 +88,7 @@ std::string program_name() {
 [[noreturn]] void usage(const std::string& why) {
     log::error("{}", why);
     log::error(
-        "usage: {} --data <install>/active/{}/data [--cards DIR] [--frames N] [--keep-going]",
+        "usage: {} --data <install>/active/{}/data [--cards DIR] [--frames N] [--keep-going] [--level N]",
         program_name(),
         openrac_game.game
     );
@@ -134,6 +136,8 @@ Options parse(int argc, char** argv) {
             o.levels = value();
         } else if (a == "--frames") {
             o.frames = std::stol(value());
+        } else if (a == "--level") {
+            openrac_game_start_level = std::stoi(value());
         } else if (a == "--keep-going") {
             o.keep_going = true;
         } else if (a == "--help" || a == "-h") {
@@ -451,6 +455,35 @@ int openrac_game_pad(int port, uint16_t* buttons, uint8_t analog[4]) {
 
 }  // extern "C"
 
+// A level's program as the extractor wrote it (decompiler_out/<game>/levels/NN/overlay.bin): the
+// pieces the game's ParseBin copies in, each a header (load address, size, a word, entry) and its
+// bytes, while the entry stays the same. For the runtime's level-to-level relocation.
+static void load_level_program(int level) {
+    char name[8];
+    std::snprintf(name, sizeof(name), "%02d", level);
+    const fs::path path =
+        g_options.data / "decompiler_out" / openrac_game.game / "levels" / name / "overlay.bin";
+    std::vector<std::uint8_t> bytes;
+    if (!runtime::read_file(path, &bytes)) {
+        log::warn("level {}'s program is not in {}: its shared functions are not relocated",
+                  level, path.string());
+        return;
+    }
+    std::uint32_t entry = 0;
+    for (std::size_t at = 0; at + 16 <= bytes.size();) {
+        std::uint32_t head[4];
+        std::memcpy(head, bytes.data() + at, sizeof(head));
+        if (entry == 0) {
+            entry = head[3];
+        }
+        if (head[3] != entry || at + 16 + head[1] > bytes.size()) {
+            break;
+        }
+        openrac_guest_add_level_program(level, head[0], bytes.data() + at + 16, head[1]);
+        at += 16 + head[1];
+    }
+}
+
 int main(int argc, char** argv) {
     g_options = parse(argc, argv);
     const fs::path iso = g_options.data / "iso_data" / openrac_game.game;
@@ -506,6 +539,7 @@ int main(int argc, char** argv) {
 
     openrac_game_register_functions();
     openrac_guest_set_overlay_source(openrac_game_loaded_overlay);
+    openrac_guest_set_level_programs(load_level_program);
     openrac_guest_stop_on_missing(g_options.keep_going ? 0 : 1);
     std::atexit(finish);
 
