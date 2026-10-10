@@ -221,12 +221,18 @@ renderer::Mat4 rigid_inverse(const renderer::Mat4& m) {
 
 // The extracted level the title world is written as (editor/level.py load_title).
 constexpr int kTitleWorld = 99;
+// The flight between planets' sky, written as a level of its own (editor/level.py load_flight).
+constexpr int kFlightWorld = 98;
+// The game mode word (0x15F6E8); 6 in the boot program is the flight between planets.
+constexpr std::uint32_t kGameMode = 0x0015F6E8;
 
 // Uploads a level's geometry; while the boot program runs (the title and the main menu), the title
 // world's, or level 0's when the title world was not extracted.
 void use_level(int number) {
     int wanted = number;
-    if (number < 0) {
+    if (number == -2 && std::filesystem::exists(g->levels / std::format("level_{:02d}", kFlightWorld))) {
+        wanted = kFlightWorld;
+    } else if (number < 0) {
         wanted = std::filesystem::exists(g->levels / std::format("level_{:02d}", kTitleWorld)) ? kTitleWorld : 0;
     }
     if (wanted == g->loaded) {
@@ -434,7 +440,8 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
     const int level = openrac_game_loaded_overlay();
     const viewer::GameAddresses& a =
         level >= 0 && level < 19 ? viewer::kRac1PalLevels[level] : viewer::kRac1Pal;
-    use_level(level >= 0 && level < 19 ? level : -1);
+    // The boot program's worlds: the flight between planets (game mode 6), else the title world.
+    use_level(level >= 0 && level < 19 ? level : word_at(ram, kGameMode) == 6 ? -2 : -1);
     viewer::GameState state = viewer::read_game_state(ram, a);
     // The world is drawn from the camera the game's world renderers used, not from whatever the
     // camera globals hold at the end of the frame (the page menu sets its own camera, at
@@ -509,6 +516,26 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
             }
         }
         const int joints = g->level.models[instance.model].joints;
+        if (debug && g->index % 100 == 0 && m.class_id == 0) {
+            // The hero, for bring-up: where he is and what his animation fields and pose say.
+            const auto pose = viewer::moby_palette(ram, m.address);
+            const std::uint8_t* b = ram.data() + m.address;
+            float t = 0.0f;
+            std::memcpy(&t, b + 0x54, 4);
+            bool finite = !pose.empty();
+            for (const auto& f : pose) {
+                for (const auto& row : f) {
+                    for (float x : row) {
+                        finite = finite && std::isfinite(x) && std::fabs(x) < 1.0e6f;
+                    }
+                }
+            }
+            log::info("  hero at {:#x}: position {:.2f} {:.2f} {:.2f}, scale {:.3f}, keys {}:{} -> {}:{} t {:.3f}, "
+                      "{} joints posed ({} in the mesh), {}, mode {:#x}",
+                      m.address, m.matrix[12], m.matrix[13], m.matrix[14], m.matrix[0], b[0x52], b[0x50],
+                      b[0x53], b[0x51], t, pose.size(), joints, finite ? "finite" : "NOT finite",
+                      static_cast<unsigned>(b[0x34] | b[0x35] << 8));
+        }
         if (animate && joints > 0) {
             const auto pose = viewer::moby_palette(ram, m.address);
             if (!pose.empty()) {
@@ -612,23 +639,29 @@ bool pad(int port, std::uint16_t* buttons, std::uint8_t analog[4]) {
     }
     const platform::Pad& p = g->input.pad(port);
     *buttons = p.buttons;
-    // OPENRAC_PRESS=FRAME:MASK:FRAMES,... holds buttons (mask bits as the pad reports them, 0x4000
-    // cross, 0x8 start) for scripted checks.
+    analog[0] = p.right_x;
+    analog[1] = p.right_y;
+    analog[2] = p.left_x;
+    analog[3] = p.left_y;
+    // OPENRAC_PRESS=FRAME:MASK:FRAMES[:LX:LY],... holds buttons (mask bits as the pad reports them,
+    // 0x4000 cross, 0x8 start) and optionally the left stick (0-255, 128 centred; 0 is left or
+    // up) for scripted checks. FRAME counts the window's frames (world, 2D and movie frames).
     if (const char* script = port == 0 ? std::getenv("OPENRAC_PRESS") : nullptr) {
         for (const char* at = script; at && *at;) {
             unsigned long frame = 0, mask = 0, length = 5;
-            if (std::sscanf(at, "%lu:%lx:%lu", &frame, &mask, &length) >= 2 && g->index >= frame
-                && g->index < frame + length) {
+            unsigned int lx = 128, ly = 128;
+            const int read = std::sscanf(at, "%lu:%lx:%lu:%u:%u", &frame, &mask, &length, &lx, &ly);
+            if (read >= 2 && g->index >= frame && g->index < frame + length) {
                 *buttons = static_cast<std::uint16_t>(*buttons & ~mask);
+                if (read >= 5) {
+                    analog[2] = static_cast<std::uint8_t>(lx);
+                    analog[3] = static_cast<std::uint8_t>(ly);
+                }
             }
             at = std::strchr(at, ',');
             at = at ? at + 1 : nullptr;
         }
     }
-    analog[0] = p.right_x;
-    analog[1] = p.right_y;
-    analog[2] = p.left_x;
-    analog[3] = p.left_y;
     return true;
 }
 
