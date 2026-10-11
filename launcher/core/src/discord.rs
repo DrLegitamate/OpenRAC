@@ -21,6 +21,16 @@ pub const DEFAULT_CLIENT_ID: &str = "1558096324602363955";
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
+    /// The name after "Playing": the Discord application's own name when left out. While a game
+    /// plays it is the game's title, so Discord shows "Playing Ratchet & Clank".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 0: Playing.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<u8>,
+    /// What the member list shows after "Playing": 0 the name, 1 the state, 2 the details.
+    #[serde(rename = "status_display_type", skip_serializing_if = "Option::is_none")]
+    pub status_display_type: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,9 +112,12 @@ pub struct DiscordIpc {
     seq: u64,
     /// The planet the running game reported (`planet_from_log`), shown while it plays, and since
     /// when (the elapsed time counts from there).
-    planet: Option<String>,
+    planet: Option<Place>,
     planet_since: u64,
     last: Option<(DiscordStatus, u64)>,
+    /// No new connection attempt before this (seconds): a socket Discord no longer answers costs
+    /// a whole handshake wait, so it is not retried on every status change.
+    retry_at: u64,
 }
 
 impl DiscordIpc {
@@ -117,6 +130,7 @@ impl DiscordIpc {
             planet: None,
             planet_since: 0,
             last: None,
+            retry_at: 0,
         }
     }
 
@@ -125,6 +139,7 @@ impl DiscordIpc {
         if self.client_id != new_id {
             self.client_id = new_id;
             self.disconnect();
+            self.retry_at = 0;
         }
     }
 
@@ -139,6 +154,9 @@ impl DiscordIpc {
     fn connect(&mut self) -> Result<&mut Connection, String> {
         if self.stream.is_some() {
             return self.stream.as_mut().ok_or_else(|| "Discord IPC socket closed".to_string());
+        }
+        if now_sec() < self.retry_at {
+            return Err("Discord IPC socket not available".to_string());
         }
 
         for path in find_socket_paths() {
@@ -157,6 +175,7 @@ impl DiscordIpc {
                 match read_packet(&mut stream) {
                     Ok((opcode, data)) => {
                         if opcode == 1 {
+                            set_reply_timeout(&stream);
                             return Ok(self.stream.insert(stream));
                         } else if opcode == 2 {
                             if let Ok(err) = std::str::from_utf8(&data) {
@@ -171,6 +190,7 @@ impl DiscordIpc {
             }
         }
 
+        self.retry_at = now_sec() + RETRY_SECS;
         Err("Discord IPC socket not available".to_string())
     }
 
@@ -217,7 +237,7 @@ impl DiscordIpc {
     }
 
     /// The planet being played; shown at once if a game is playing.
-    pub fn set_planet(&mut self, planet: Option<String>) -> Result<(), String> {
+    pub fn set_planet(&mut self, planet: Option<Place>) -> Result<(), String> {
         if self.planet == planet {
             return Ok(());
         }
@@ -233,7 +253,6 @@ impl DiscordIpc {
         self.last = Some((status.clone(), app_start));
         let activity = match status {
             DiscordStatus::Idle => Activity {
-                buttons: None,
                 details: Some("In Launcher".into()),
                 state: Some("Browsing Library".into()),
                 timestamps: Some(ActivityTimestamps { start: Some(app_start), end: None }),
@@ -243,6 +262,7 @@ impl DiscordIpc {
                     small_image: None,
                     small_text: None,
                 }),
+                ..Default::default()
             },
             DiscordStatus::ViewingGame { title, region, progress_pct, game_id: _ } => {
                 let state_str = match progress_pct {
@@ -250,7 +270,6 @@ impl DiscordIpc {
                     None => region.clone(),
                 };
                 Activity {
-                    buttons: None,
                     details: Some(format!("Viewing {title}")),
                     state: Some(state_str),
                     timestamps: Some(ActivityTimestamps { start: Some(app_start), end: None }),
@@ -260,17 +279,20 @@ impl DiscordIpc {
                         small_image: None,
                         small_text: None,
                     }),
+                    ..Default::default()
                 }
             }
             DiscordStatus::PlayingGame { title, region, game_id, start_time } => {
                 let current_sec = now_sec();
                 Activity {
-                    buttons: None,
-                    details: Some(format!("Playing {title}")),
-                    state: Some(match &self.planet {
-                        Some(planet) => format!("On {planet} ({region})"),
-                        None => format!("In Game ({region})"),
+                    name: Some(title.clone()),
+                    kind: Some(0),
+                    status_display_type: Some(0),
+                    details: Some(match &self.planet {
+                        Some(place) => format!("Exploring {}", place.planet),
+                        None => "In the menus".into(),
                     }),
+                    state: self.planet.as_ref().and_then(|place| place.location.clone()),
                     timestamps: Some(ActivityTimestamps {
                         start: Some(match self.planet {
                             Some(_) => self.planet_since,
@@ -280,10 +302,11 @@ impl DiscordIpc {
                     }),
                     assets: Some(ActivityAssets {
                         large_image: Some(game_image_url(game_id)),
-                        large_text: Some(title.clone()),
+                        large_text: Some(format!("{title} ({region})")),
                         small_image: Some("https://openrac.dev/wrench.webp".into()),
                         small_text: Some("OpenRAC".into()),
                     }),
+                    ..Default::default()
                 }
             }
             DiscordStatus::Working { task, title, game_id, start_time } => Activity {
@@ -296,7 +319,7 @@ impl DiscordIpc {
                     small_image: Some("https://openrac.dev/wrench.webp".into()),
                     small_text: Some("OpenRAC".into()),
                 }),
-                buttons: None,
+                ..Default::default()
             },
         };
         let activity = Activity { buttons: buttons(), ..activity };
@@ -309,13 +332,23 @@ impl DiscordIpc {
     }
 }
 
+/// Where the player is: the planet, and the place on it when the game's level is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub planet: String,
+    pub location: Option<String>,
+}
+
 /// The level a running port announces in its log ("now playing level N", port/game/common/main.cpp)
-/// as a planet name, for the games whose levels are known.
-pub fn planet_from_log(game: &str, line: &str) -> Option<String> {
+/// as a place, for the games whose levels are known.
+pub fn planet_from_log(game: &str, line: &str) -> Option<Place> {
     let level: usize = line.split("now playing level ").nth(1)?.trim().parse().ok()?;
     match game {
-        "rac1" => crate::saves::RAC1_PLANETS.get(level).map(|p| p.to_string()),
-        _ => Some(format!("Level {level}")),
+        "rac1" => Some(Place {
+            planet: crate::saves::RAC1_PLANETS.get(level)?.to_string(),
+            location: crate::saves::RAC1_LOCATIONS.get(level).map(|l| l.to_string()),
+        }),
+        _ => Some(Place { planet: format!("Level {level}"), location: None }),
     }
 }
 
@@ -333,13 +366,31 @@ pub fn now_sec() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// Discord answers the handshake in anything from a few hundred milliseconds to several seconds;
+/// a shorter wait never connects. Callers run off the UI thread, so the wait stalls nothing.
+#[cfg(unix)]
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// An activity's reply, read so that replies do not pile up in the socket.
+#[cfg(unix)]
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(any(unix, windows))]
+const RETRY_SECS: u64 = 15;
+
 #[cfg(unix)]
 fn open_connection(path: &std::path::Path) -> Option<Connection> {
     let stream = std::os::unix::net::UnixStream::connect(path).ok()?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(150)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(150)));
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REPLY_TIMEOUT));
     Some(stream)
 }
+
+#[cfg(unix)]
+fn set_reply_timeout(stream: &Connection) {
+    let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT));
+}
+
+#[cfg(windows)]
+fn set_reply_timeout(_: &Connection) {}
 
 /// A pipe has no timeouts: Discord answers every packet, so a read returns.
 #[cfg(windows)]
@@ -441,9 +492,12 @@ mod tests {
     #[test]
     fn serializes_activity_cleanly() {
         let act = Activity {
+            name: Some("Ratchet & Clank".into()),
+            kind: Some(0),
+            status_display_type: Some(0),
             buttons: buttons(),
-            details: Some("Playing Ratchet & Clank".into()),
-            state: Some("In Game (PAL)".into()),
+            details: Some("Exploring Kerwan".into()),
+            state: None,
             timestamps: Some(ActivityTimestamps { start: Some(1700000000), end: None }),
             assets: Some(ActivityAssets {
                 large_image: Some(game_image_url("rac1")),
@@ -454,15 +508,27 @@ mod tests {
         };
 
         let json = serde_json::to_string(&act).unwrap();
-        assert!(json.contains("Playing Ratchet & Clank"));
+        assert!(json.contains("\"name\":\"Ratchet & Clank\",\"type\":0,\"status_display_type\":0"));
+        assert!(json.contains("\"details\":\"Exploring Kerwan\""));
+        assert!(!json.contains("\"state\""));
         assert!(json.contains("\"large_image\":\"rac1\""));
         assert!(json.contains("\"buttons\":[{\"label\":\"OpenRAC\",\"url\":\"https://openrac.dev\"}"));
     }
 
     #[test]
     fn reads_the_planet_from_the_port_log() {
-        assert_eq!(planet_from_log("rac1", "[info] now playing level 3").as_deref(), Some("Kerwan"));
-        assert_eq!(planet_from_log("rac2", "[info] now playing level 4").as_deref(), Some("Level 4"));
+        assert_eq!(
+            planet_from_log("rac1", "[info] now playing level 3"),
+            Some(Place { planet: "Kerwan".into(), location: Some("Metropolis".into()) })
+        );
+        assert_eq!(
+            planet_from_log("rac1", "[info] now playing level 6"),
+            Some(Place { planet: "Nebula G34".into(), location: Some("Blarg Station".into()) })
+        );
+        assert_eq!(
+            planet_from_log("rac2", "[info] now playing level 4"),
+            Some(Place { planet: "Level 4".into(), location: None })
+        );
         assert_eq!(planet_from_log("rac1", "[info] 4000 frames"), None);
     }
 
