@@ -210,6 +210,35 @@ mod tests {
         assert_eq!(plan.args, ["--path", "assets/levels/rac1/level_07", "res://levels/level_07/level_07.tscn"]);
     }
 
+    /// The port is one program for Windows, Linux and macOS: building it and playing it are
+    /// offered on all three. (Play was once listed for Windows and Linux only, which hid it on
+    /// a Mac where the port had been built and run.)
+    #[test]
+    fn building_and_playing_the_port_are_not_tied_to_a_platform() {
+        let file = actions::load(&checkout()).unwrap();
+        let scope = Scope::Version("rac1/pal".into());
+        for id in ["port-build", "play", "play-edited"] {
+            let action = file.find(&scope, id).unwrap_or_else(|| panic!("rac1/pal has no {id}"));
+            assert!(action.platforms.is_empty(), "{id} is limited to {:?}", action.platforms);
+        }
+    }
+
+    /// Play draws from the levels `port-levels` writes, so it names them and waits for them.
+    /// (It once started without: menus with no world behind them.)
+    #[test]
+    fn play_waits_for_the_levels_it_draws() {
+        let file = actions::load(&checkout()).unwrap();
+        let scope = Scope::Version("rac1/pal".into());
+        let made = file.find(&scope, "port-levels").and_then(|a| a.artifact.clone()).expect("port-levels makes a file");
+        for id in ["play", "play-edited"] {
+            let action = file.find(&scope, id).unwrap();
+            assert!(action.needs.iter().any(|n| n.path == made), "{id} does not wait for {made}");
+            let at = action.args.iter().position(|a| a == "--levels").unwrap_or_else(|| panic!("{id} has no --levels"));
+            let dir = action.args[at + 1].trim_start_matches("{root}/");
+            assert!(made.starts_with(dir), "{id} draws from {dir}, port-levels writes {made}");
+        }
+    }
+
     #[test]
     fn play_runs_only_once_the_port_is_built() {
         let root = checkout();

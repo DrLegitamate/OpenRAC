@@ -47,6 +47,9 @@ pub struct Action {
     #[serde(default)]
     pub description: String,
     pub kind: Kind,
+    /// Which of the game's parts it works on; the decompilation when left out.
+    #[serde(default)]
+    pub area: Area,
     /// How far the action is wired up; see [`State`].
     #[serde(default)]
     pub state: State,
@@ -70,6 +73,10 @@ pub struct Action {
     /// relative to the checkout. `{artifact}` in the arguments.
     #[serde(default)]
     pub artifact: Option<String>,
+    /// Files an earlier step makes and this one cannot run without, relative
+    /// to the checkout: each is `{"path": ..., "from": the step's label}`.
+    #[serde(default)]
+    pub needs: Vec<Need>,
     /// Start it and let it run on its own (the game, Godot), instead of
     /// as a job in Tasks whose output the launcher shows.
     #[serde(default)]
@@ -81,6 +88,19 @@ pub struct Action {
     /// Not shown to players.
     #[serde(default)]
     pub todo: Option<String>,
+}
+
+/// What an action works on. A game has two builds, and the launcher keeps them apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Area {
+    /// The decompilation: the original program rebuilt and compared with the disc.
+    #[default]
+    Decomp,
+    /// The PC port: the game built for this computer, and playing it.
+    Port,
+    /// The level editor.
+    Editor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +176,14 @@ pub enum Requirement {
     Artifact,
 }
 
+/// A file an action needs and the step that makes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Need {
+    pub path: String,
+    pub from: String,
+}
+
 /// Where an action belongs: the checkout, or one version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "key")]
@@ -172,6 +200,7 @@ pub struct ActionView {
     pub label: String,
     pub description: String,
     pub kind: Kind,
+    pub area: Area,
     pub state: State,
     pub detached: bool,
     pub docs: Option<String>,
@@ -182,6 +211,8 @@ pub struct ActionView {
     pub runnable: bool,
     /// Why not, in words, one per missing thing.
     pub blockers: Vec<String>,
+    /// Its `artifact` exists: for a step that makes one, it has been done.
+    pub done: bool,
 }
 
 /// An action turned into a command line.
@@ -260,7 +291,8 @@ impl ActionFile {
                 if action.state == State::Planned && action.todo.is_none() {
                     problems.push(format!("{at}: planned, so it needs a todo saying what is missing"));
                 }
-                let texts = action.program.iter().chain(&action.args).chain(&action.cwd);
+                let needs = action.needs.iter().map(|n| &n.path);
+                let texts = action.program.iter().chain(&action.args).chain(&action.cwd).chain(needs);
                 for text in texts {
                     for name in placeholders(text) {
                         if !PLACEHOLDERS.contains(&name.as_str()) {
@@ -304,6 +336,7 @@ impl Action {
             label: self.label.clone(),
             description: self.description.clone(),
             kind: self.kind,
+            area: self.area,
             state: self.state,
             detached: self.detached,
             docs: self.docs.clone(),
@@ -311,6 +344,7 @@ impl Action {
             this_platform: self.platforms.is_empty() || self.platforms.contains(&ctx.platform),
             runnable: blockers.is_empty(),
             blockers,
+            done: self.artifact_path(ctx).is_ok_and(|p| p.exists()),
         }
     }
 
@@ -349,6 +383,11 @@ impl Action {
                 };
             if let Some(what) = missing {
                 out.push(format!("needs {what}"));
+            }
+        }
+        for need in &self.needs {
+            if !fill(&need.path, ctx, None).is_ok_and(|p| abs(ctx.root, &p).exists()) {
+                out.push(format!("needs {}", need.from));
             }
         }
         out
