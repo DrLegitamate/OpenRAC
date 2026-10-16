@@ -17,7 +17,7 @@ in the zip's one top folder) and files laid out as the extracted levels are:
 
   openrac-mod.json                  {"format": 1, "game": "rac1", "version": "pal",
                                      "name": ..., "author": ..., "description": ...,
-                                     "levels_format": 2, "replaces": {...}}
+                                     "levels_format": 3, "replaces": {...}}
   level_NN/textures/<name>.png      a texture, any size of the same shape
   level_NN/mobys/moby_<class>.glb   a class's model, as the port reads it
   level_NN/ties/tie_<class>.glb, level_NN/shrubs/shrub_<class>.glb
@@ -48,12 +48,19 @@ import sys
 import tempfile
 import zipfile
 
+import disc
+from port import FORMAT
+
 MANIFEST = "openrac-mod.json"
 STATE = "overrides.json"
 MARKER = ".openrac-stack"
 PACK_FORMAT = 1
-GAME, VERSION = "rac1", "pal"
-LEVELS_FORMAT = 2
+GAME = "rac1"
+VERSIONS = tuple(v.key for v in disc.VERSIONS)  # the discs a pack's files can come from: pal, ntsc
+LEVELS_FORMAT = FORMAT
+# The oldest levels format whose models a pack's models are drawn with: 2 gave the mobys their
+# metal packets and chrome and glass maps; 3 only added classes (port.py FORMAT).
+MODELS_SINCE = 2
 FILES = re.compile(r"^(?:patches\.tsv|level_\d{2}/(?:textures/[A-Za-z0-9_.-]+\.png|(?:mobys|ties|shrubs)/"
                    r"[A-Za-z0-9_.-]+\.glb|placements\.json|gameplay_pal\.wad))$")
 PEOPLE = re.compile(r"^(?:[^/]+\.(?:txt|md)|(?:README|LICENSE|CREDITS)[^/]*)$", re.IGNORECASE)
@@ -91,9 +98,9 @@ def read_manifest(data: bytes, where: str) -> dict:
         raise PackError(f"{where}: {MANIFEST} is not a JSON object")
     if manifest.get("format") != PACK_FORMAT:
         raise PackError(f"{where}: pack format {manifest.get('format')!r}; this OpenRAC reads {PACK_FORMAT}")
-    if (manifest.get("game"), manifest.get("version")) != (GAME, VERSION):
-        raise PackError(f"{where} is for {manifest.get('game')}/{manifest.get('version')}, not "
-                        f"Ratchet & Clank PAL ({GAME}/{VERSION})")
+    if manifest.get("game") != GAME or manifest.get("version", "pal") not in VERSIONS:
+        raise PackError(f"{where} is not a pack for Ratchet & Clank ({manifest.get('game')}/"
+                        f"{manifest.get('version')})")
     name = manifest.get("name")
     if not isinstance(name, str) or not name.strip() or len(name) > 120:
         raise PackError(f"{where}: {MANIFEST} needs a \"name\" (up to 120 characters)")
@@ -197,9 +204,10 @@ def check(path: Path) -> tuple[dict, list[str], list[str], list[str]]:
                 problems.append(f"{rel}: {exc}")
                 continue
             used.append(rel)
-        if manifest.get("levels_format", LEVELS_FORMAT) != LEVELS_FORMAT and any(r.endswith(".glb") for r in used):
-            problems.append(f"its models were made for levels of format {manifest.get('levels_format')}, and these "
-                            f"are {LEVELS_FORMAT}: they may not fit; ask its author for a new version")
+        made = manifest.get("levels_format", LEVELS_FORMAT)
+        if (not isinstance(made, int) or made < MODELS_SINCE) and any(r.endswith(".glb") for r in used):
+            problems.append(f"its models were made for levels of format {made}, and these are {LEVELS_FORMAT}: "
+                            "they may not fit; ask its author for a new version")
         if not used:
             raise PackError(f"{source.path.name} replaces nothing: it has no file laid out as the levels are "
                             "(level_NN/textures/*.png, level_NN/mobys/*.glb...)")
