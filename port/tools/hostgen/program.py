@@ -126,6 +126,13 @@ class Program:
                 break
         if not named and symbol in self.symbols:
             named = [(-1, self.symbols[symbol])]
+        if symbol not in self.places and named:
+            # Another spelling of the same function (func_L00_00256F14 for the catalogue's
+            # FUN_L00_00256f14) has the catalogue's places in the other levels.
+            other = self._place_owner().get(named[0])
+            if other is not None and other != symbol:
+                exe = [p for p in named if p[0] < 0 and p not in self.places[other]]
+                return exe + self.places[other]
         if symbol in self.places:
             # A function of the executable that the levels' programs also
             # carry is in the catalogue with its level places only: it keeps
@@ -133,6 +140,21 @@ class Program:
             exe = [p for p in named if p[0] < 0 and p not in self.places[symbol]]
             return exe + self.places[symbol]
         return named
+
+    def _place_owner(self) -> dict:
+        """The catalogue's functions by their own address: (overlay, address) of the name."""
+        owner = getattr(self, "_owner_cache", None)
+        if owner is None or len(owner) == 0 and self.places:
+            owner = {}
+            for sym in self.places:
+                for pattern in self.code_names:
+                    m = pattern.match(sym)
+                    if m:
+                        overlay = m.groupdict().get("overlay")
+                        owner.setdefault((int(overlay) if overlay is not None else -1, int(m.group("addr"), 16)), sym)
+                        break
+            self._owner_cache = owner
+        return owner
 
     def data_address(self, symbol: str) -> int | None:
         if symbol in self.symbols:
@@ -147,13 +169,28 @@ class Program:
         """Every function with C (or the port's own) by where it sits, so that
         two spellings of one address (FUN_0020c828, func_0020C828) meet."""
         self.by_place = {}
+        self.host_place = {}
+        for sym in sorted(self.host):
+            if sym:
+                # The port's own function replaces whatever the decompilation has at its place,
+                # under any spelling (a table carried from another version names it func_<addr>
+                # where this decompilation has FUN_<addr> with C of its own).
+                for place in self.code_places(sym):
+                    self.host_place.setdefault(place, sym)
+                    self.by_place[place] = self.host_place[place]
         for sym, f in sorted(self.functions.items()):
-            if f.unit is not None or sym in self.host:
+            if f.unit is not None:
                 for place in self.code_places(sym):
                     self.by_place.setdefault(place, sym)
 
     def canonical(self, symbol: str) -> str:
-        """The symbol with C at the same place as symbol, or symbol."""
+        """The symbol with C at the same place as symbol, or symbol: the port's own function
+        there before the decompilation's C."""
+        if symbol not in self.host:
+            for place in self.code_places(symbol):
+                other = getattr(self, "host_place", {}).get(place)
+                if other is not None and other != symbol:
+                    return other
         f = self.functions.get(symbol)
         if f is not None and (f.unit is not None or symbol in self.host):
             return symbol
