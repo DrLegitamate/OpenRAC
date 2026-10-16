@@ -331,6 +331,8 @@ void GifInterpreter::write_register(std::uint8_t address, std::uint64_t value) {
                 d.state.target = offscreen_target();
                 d.first = static_cast<std::uint32_t>(m_vertices.size());
                 d.mobys = value;
+                d.centre_x = 2048.0f - static_cast<float>(context().xyoffset.ofx) / 16.0f;
+                d.centre_y = 2048.0f - static_cast<float>(context().xyoffset.ofy) / 16.0f;
                 m_draws.push_back(d);
             }
             return;
@@ -1025,9 +1027,9 @@ void GifInterpreter::emit_sprite(const GsVertex& a, const GsVertex& b) {
         const gs::Alpha& al = context().alpha;
         const gs::Scissor& sc = context().scissor;
         log::info(
-            "sprite ({},{})-({},{}) rgba {:02x}{:02x}{:02x}{:02x} tme {} psm {:#x} cbp {:#x} tbw {} tbp {:#x} abe {} alpha {}{}{}{} fix {:#x} scissor {}-{}x{}-{} fbp {:#x} fbmsk {:#x} test {}",
-            a.x / 16.0, a.y / 16.0, b.x / 16.0, b.y / 16.0, b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3],
-            attributes().tme, context().tex0.psm, context().tex0.cbp, context().tex0.tbw, context().tex0.tbp0, attributes().abe, al.a, al.b, al.c, al.d, al.fix,
+            "sprite ({},{})-({},{}) uv ({},{})-({},{}) rgba {:02x}{:02x}{:02x}{:02x} tme {} psm {:#x} cbp {:#x} tbw {} tbp {:#x} mag {} min {} abe {} alpha {}{}{}{} fix {:#x} scissor {}-{}x{}-{} fbp {:#x} fbmsk {:#x} test {}",
+            a.x / 16.0, a.y / 16.0, b.x / 16.0, b.y / 16.0, a.u / 16.0, a.v / 16.0, b.u / 16.0, b.v / 16.0, b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3],
+            attributes().tme, context().tex0.psm, context().tex0.cbp, context().tex0.tbw, context().tex0.tbp0, context().tex1.mmag, context().tex1.mmin, attributes().abe, al.a, al.b, al.c, al.d, al.fix,
             sc.x0, sc.x1, sc.y0, sc.y1, context().frame.fbp, context().frame.fbmsk, test_text(context().test)
         );
     }
@@ -1507,7 +1509,7 @@ void DirectRenderer::draw(const DirectDraw& d, RenderState& render_state) {
         if (m_frame != nullptr && m_frame->target_mobys && s.target != 0) {
             const Offscreen& o = offscreen(s.target);
             glBindFramebuffer(GL_FRAMEBUFFER, o.framebuffer);
-            m_frame->target_mobys(d.mobys, o.framebuffer, kOffscreenPixels * kOffscreenScale);
+            m_frame->target_mobys(d.mobys, o.framebuffer, kOffscreenPixels * kOffscreenScale, d.centre_x, d.centre_y);
             glDisable(GL_CULL_FACE);
             glDisable(GL_SCISSOR_TEST);
             m_shader.use();
@@ -1663,7 +1665,7 @@ void DirectRenderer::flush(RenderState& state, bool background) {
     if (k < 1.0f) {
         for (const Run& r : runs) {
             m_whole_target = r.whole;
-            draw(DirectDraw{r.draw->state, r.first, r.count, r.draw->mobys}, state);
+            draw(DirectDraw{r.draw->state, r.first, r.count, r.draw->mobys, r.draw->centre_x, r.draw->centre_y}, state);
         }
         m_whole_target = true;
     } else {
