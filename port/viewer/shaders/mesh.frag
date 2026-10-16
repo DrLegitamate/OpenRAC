@@ -26,6 +26,9 @@ uniform int translucent_pass;
 // Mobys MobyProc blends (an explosion's flash, a fading pickup): every face and texel, its alpha
 // the texel's times the moby's (the tint), blended by the pass.
 uniform int effect_pass;
+// The metal pass: the chrome or glass texel times the vertex colour, its alpha the texel's times the
+// shine, blended over the moby (mesh.vert; ALPHA 0x44 as the moby's own).
+uniform int metal_pass;
 uniform vec4 fog_colour;  // FOGCOL; w = 1: fog on
 
 layout(location = 0) out vec4 out_colour;
@@ -34,6 +37,15 @@ layout(location = 0) out vec4 out_colour;
 const vec3 kSun = vec3(0.36, 0.48, 0.80);
 
 void main() {
+    if (metal_pass != 0) {
+        vec4 m = texture(tex_T0, v_uv) * v_colour;
+        vec3 mrgb = min(m.rgb, vec3(1.0));
+        if (fog_colour.w > 0.5) {
+            mrgb = mix(fog_colour.rgb, mrgb, v_fog);
+        }
+        out_colour = vec4(mrgb, clamp(m.a, 0.0, 1.0));
+        return;
+    }
     if (effect_pass == 0 && v_glow != glow_pass) {
         discard;
     }
@@ -46,7 +58,9 @@ void main() {
         out_colour = vec4(e, clamp(c.a, 0.0, 1.0));
         return;
     }
-    if (cutout != 0 && translucent_pass == 0 && c.a < 0.99) {
+    // The glow pass blends every texel at its alpha (the Gadgetron hologram's lettering is mostly
+    // part-transparent texels); only the solid pass leaves a cutout's part-transparent texels out.
+    if (cutout != 0 && translucent_pass == 0 && glow_pass == 0 && c.a < 0.99) {
         discard;
     }
     if (translucent_pass != 0 && (cutout == 0 || c.a >= 0.99 || c.a < 0.02)) {

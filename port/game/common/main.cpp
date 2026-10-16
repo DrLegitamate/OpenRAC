@@ -77,6 +77,8 @@ int openrac_game_no_card = 0;
 int openrac_game_start_level = -1;
 void (*openrac_game_on_frame)(unsigned frame) = nullptr;
 int (*openrac_game_bolts)(void) = nullptr;
+int (*openrac_game_in_cutscene)(void) = nullptr;
+void (*openrac_game_skip)(void) = nullptr;
 }
 
 namespace {

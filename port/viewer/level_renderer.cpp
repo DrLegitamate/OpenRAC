@@ -57,11 +57,21 @@ bool LevelScene::upload(
     renderer::Rgba8Image white(1, 1);
     white.set_texel(0, 0, 0xFFFFFFFFu);
     m_white = textures.add(std::move(white), renderer::AlphaScale::Full, "white");
+    // The cutout materials' moby textures (the hologram's lettering, fences, foliage) with one
+    // level, bilinear: the GS samples moby textures without mip levels (TEX1 MXL 0), and a mipmap
+    // chain averages a cutout's alpha away at a distance (thin, broken letters).
+    std::vector<bool> cutout_moby(level.images.size(), false);
+    for (const Material& m : level.materials) {
+        if (m.cutout && m.image >= 0 && static_cast<std::size_t>(m.image) < level.images.size()
+            && level.image_paths[static_cast<std::size_t>(m.image)].find("/textures/moby_") != std::string::npos) {
+            cutout_moby[static_cast<std::size_t>(m.image)] = true;
+        }
+    }
     for (std::size_t i = 0; i < level.images.size(); ++i) {
         m_textures.push_back(
             level.images[i].width > 0
-                ? textures
-                      .add(level.images[i], renderer::AlphaScale::Full, level.image_paths[i], true)
+                ? textures.add(level.images[i], renderer::AlphaScale::Full, level.image_paths[i], !cutout_moby[i],
+                               cutout_moby[i])
                 : m_white
         );
     }
@@ -450,9 +460,12 @@ void LevelScene::draw_layer(
     const int glow_pass = m_mesh.uniform("glow_pass");
     const int translucent_pass = m_mesh.uniform("translucent_pass");
     const int effect_pass = m_mesh.uniform("effect_pass");
+    const int metal_pass = m_mesh.uniform("metal_pass");
     glUniform1i(effect_pass, 0);
-    // Mobys: a fourth pass for those MobyProc blends (Instance::blend), after everything else.
-    const int passes = layer == Layer::Mobys ? 4 : 2;
+    glUniform1i(metal_pass, 0);
+    // Mobys: a fourth pass for those MobyProc blends (Instance::blend), then a fifth for the metal
+    // packets (the shine pass), after everything else.
+    const int passes = layer == Layer::Mobys ? 5 : 2;
     // The material state the program holds now (flush): none yet.
     int set_material = -1;
     unsigned set_texture = 0;
@@ -464,7 +477,11 @@ void LevelScene::draw_layer(
         // ALPHA 0x44, (Cs - Cd) As + Cd) or added (blend 2: 0x48, Cs As + Cd), depth tested and
         // not written, as ReRAC draws MobyProc's translucent and additive groups.
         const bool effects = layer == Layer::Mobys && pass == 3;
-        const bool translucent = !effects && pass == (layer == Layer::Mobys ? 2 : 1);
+        // The metal packets: blended over the moby with ALPHA 0x44, depth tested and not written,
+        // pulled a little toward the camera (MobyProc adds 1000 to their GS Z; mesh.vert).
+        const bool metal = layer == Layer::Mobys && pass == 4;
+        const bool translucent = !effects && !metal && pass == (layer == Layer::Mobys ? 2 : 1);
+        glUniform1i(metal_pass, metal ? 1 : 0);
         glUniform1i(glow_pass, layer == Layer::Mobys && pass == 1 ? 1 : 0);
         glUniform1i(translucent_pass, translucent ? 1 : 0);
         glUniform1i(effect_pass, effects ? 1 : 0);
@@ -475,7 +492,7 @@ void LevelScene::draw_layer(
             glDepthMask(GL_FALSE);
         }
         for (const Group& g : groups) {
-            if ((g.blend != 0) != effects) {
+            if (!metal && (g.blend != 0) != effects) {
                 continue;
             }
             if (effects) {
@@ -526,6 +543,10 @@ void LevelScene::draw_layer(
                 run_count = 0;
             };
             for (const Primitive& p : m_models[g.model].primitives) {
+                const bool is_metal = m_materials[static_cast<std::size_t>(p.material)].metal;
+                if (is_metal != metal) {
+                    continue;
+                }
                 if (translucent && !m_materials[static_cast<std::size_t>(p.material)].cutout) {
                     continue;
                 }

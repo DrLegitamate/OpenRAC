@@ -2018,6 +2018,11 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
             const std::uint8_t* b = ram.data() + m.address;
             const unsigned mode = b[0x34] | b[0x35] << 8;
             const unsigned alpha = b[0x23];
+            // Its shine distance (+0x73, 0x18 for a class with metal packets, 32 for the Gadgetron
+            // logo) for the metal pass, in the tie-only `lights` slot as -1 - distance (mesh.vert).
+            if (b[0x73] != 0) {
+                instance.lights = -1 - static_cast<int>(b[0x73]);
+            }
             if ((mode & 0x200) != 0) {
                 instance.blend = 2;
                 instance.tint[3] = static_cast<float>(alpha) / 128.0f;
@@ -2437,6 +2442,18 @@ bool pad(int port, std::uint16_t* buttons, std::uint8_t analog[4]) {
             }
             at = std::strchr(at, ',');
             at = at ? at + 1 : nullptr;
+        }
+    }
+    // Start skips an in-game cutscene: the game skips one on Start with L1, L2, R1 and R2 held
+    // (Start alone only once it is beaten; ReRAC cutscenes_transitions.md, "skip"), so while one
+    // plays a pressed Start also presses the four shoulders. Bits are active low: 0x8 Start,
+    // 0x0F00 L2 R2 L1 R1.
+    if (port == 0 && settings::get().skip_cutscenes && (*buttons & 0x8) == 0) {
+        if (openrac_game_in_cutscene != nullptr && openrac_game_in_cutscene() != 0) {
+            *buttons = static_cast<std::uint16_t>(*buttons & ~0x0F00);
+        }
+        if (openrac_game_skip != nullptr) {
+            openrac_game_skip();
         }
     }
     if (port == 0) {
