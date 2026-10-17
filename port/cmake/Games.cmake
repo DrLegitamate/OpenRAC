@@ -15,6 +15,7 @@
 # The decompilations are only read: hostgen works on copies in the build tree.
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+include(MacApp)
 
 # hostgen uses every core itself: one game's translation at a time (Ninja).
 set_property(GLOBAL APPEND PROPERTY JOB_POOLS openrac_hostgen=1)
@@ -175,6 +176,27 @@ function(openrac_add_game config)
     # The window's icon: the game's own or the launcher's, embedded as PNG bytes.
     openrac_window_icon("${config_dir}" "${target_id}" icon_c)
     target_sources(openrac-${id} PRIVATE "${icon_c}")
+    # The game's name as players see it, in the window's title and on macOS its bundle's name
+    # (cmake/MacApp.cmake): the title in its catalogue entry (games/<game>/game.json) and the
+    # version's video standard, "Ratchet & Clank (PAL)", "Ratchet & Clank (NTSC)".
+    string(JSON game GET "${json}" game)
+    string(REGEX REPLACE "^${game}-" "" version "${id}")
+    cmake_path(SET catalogue NORMALIZE "${OPENRAC_REPO_DIR}/games/${game}/game.json")
+    file(READ "${catalogue}" catalogue_json)
+    string(JSON title GET "${catalogue_json}" title)
+    string(JSON video ERROR_VARIABLE no_video GET "${catalogue_json}" versions "${version}" disc video)
+    if(NOT no_video)
+      set(title "${title} (${video})")
+    endif()
+    set_property(DIRECTORY "${PROJECT_SOURCE_DIR}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${catalogue}")
+    target_compile_definitions(openrac-${id} PRIVATE "OPENRAC_GAME_TITLE=\"${title}\"")
+    if(APPLE)
+      set(icon "${config_dir}/icon-macos.png")
+      if(NOT EXISTS "${icon}")
+        set(icon "${PROJECT_SOURCE_DIR}/../launcher/src-tauri/icons/icon.icns")
+      endif()
+      openrac_macos_app(openrac-${id} NAME "${title}" ID "dev.openrac.${id}" ICON "${icon}")
+    endif()
     if(TARGET openrac_media)
       target_link_libraries(openrac-${id} PRIVATE openrac_media)
       target_compile_definitions(openrac-${id} PRIVATE OPENRAC_MOVIES=1)
