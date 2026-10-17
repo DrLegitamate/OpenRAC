@@ -166,6 +166,12 @@ void openrac_guest_set_overlay_source(int (*current)(void));
 void openrac_guest_set_relocation(gaddr low, gaddr high, gaddr gp, const uint8_t* exe_code,
                                   gaddr exe_base, uint32_t exe_size);
 extern gaddr openrac_relocate_low, openrac_relocate_high;
+/* The executable as its loader placed it before the game ran (load_elf keeps a copy, openrac/elf.h):
+ * its bytes in [low, high) copied back into memory; returns how many. For a game that loads its boot
+ * program again over a level's in another build of it (rac1: Quit Game reads one from the disc whose
+ * code sits elsewhere, and whose data points there): the port's C is the executable's, so the
+ * executable's own program is what it has to find in memory. */
+uint32_t openrac_guest_restore_executable(gaddr low, gaddr high);
 gaddr openrac_relocate_data(gaddr address);
 gaddr openrac_relocate_code(gaddr address);
 static inline gaddr OPENRAC_DATA(gaddr a) {
@@ -216,7 +222,8 @@ gaddr openrac_code_in_copy(int from, gaddr canon, uint32_t size, gaddr self, gad
 /* The same for a global: where the copy at `self` reads or writes what the copy at `canon` does at
  * `target` (folded copies of one function in one program, each on its own globals: a lui and the
  * addiu, ori, load or store that completes it; an address within 0x100 of one formed there keeps
- * its offset from it). Without a place, `target` relocated as OPENRAC_LDATA. */
+ * its offset from it). Without a place, `target` relocated as OPENRAC_LDATA; `from` -1 is the
+ * executable (its code read from the executable, `target` relocated as OPENRAC_DATA). */
 gaddr openrac_data_in_copy(int from, gaddr canon, uint32_t size, gaddr self, gaddr target);
 /* The same for a call: the function the copy at `self` calls where the copy at `canon` calls
  * `target` (a small wrapper the catalogue folded, whose copies call different functions); `from`
