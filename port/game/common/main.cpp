@@ -86,6 +86,7 @@ int (*openrac_game_in_cutscene)(void) = nullptr;
 void (*openrac_game_skip)(void) = nullptr;
 int (*openrac_game_mode)(uint32_t* mode) = nullptr;
 int (*openrac_game_hero_position)(float xyz[3]) = nullptr;
+int (*openrac_game_hero)(float position[3], float rotation[3], int32_t* state) = nullptr;
 const openrac_front_end* openrac_game_front_end = nullptr;
 }
 
@@ -340,7 +341,18 @@ void crash_test() {
     }
 }
 
+// OPENRAC_REACH=FILE: the functions without C (and the zero-filled calls) this run reached, with
+// their calls (guest.h, openrac_reach_site; port/tools/regress reach). Written at exit and every
+// 600 frames, so a run that crashes still leaves most of it.
+void write_reach() {
+    static const char* path = std::getenv("OPENRAC_REACH");
+    if (path != nullptr && *path != 0 && openrac_guest_write_reach(path, openrac_game.id, g_frame) == 0) {
+        log::warn("OPENRAC_REACH: cannot write {}", path);
+    }
+}
+
 void finish() {
+    write_reach();
     openrac_guest_report_missing();
     log::info("{} frames", g_frame);
 }
@@ -465,6 +477,9 @@ int openrac_game_vsync(void) {
     }
     if (openrac_game_on_frame != nullptr) {
         openrac_game_on_frame(static_cast<unsigned>(g_frame));
+    }
+    if (g_frame % 600 == 0) {
+        write_reach();
     }
     if (g_options.frames >= 0 && g_frame >= g_options.frames) {
         std::exit(0);  // finish() runs at exit
@@ -824,6 +839,14 @@ int openrac_game_hud_side(void) {
     }
 #endif
     return 0;
+}
+
+int openrac_game_lock_strafe(void) {
+#ifdef OPENRAC_FRONTEND
+    return settings::get().lock_strafe ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 int openrac_game_ui_quad(const openrac_game_ui_rect* quad) {

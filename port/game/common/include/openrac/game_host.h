@@ -90,6 +90,10 @@ extern int (*openrac_game_in_cutscene)(void);
 extern int (*openrac_game_mode)(uint32_t* mode);
 extern int (*openrac_game_hero_position)(float xyz[3]);
 
+/* For OPENRAC_TRACE (frontend.cpp), when a game installs it (rac1: boot.c): the hero's position,
+ * rotation (game axes; z the yaw) and state id. 0 when there is none now (no level loaded). */
+extern int (*openrac_game_hero)(float position[3], float rotation[3], int32_t* state);
+
 /* A trap the game raised on purpose, or another reason the game cannot go on: writes a crash
  * report (<data>/crashes) and ends the program. */
 #ifdef __cplusplus
@@ -241,6 +245,11 @@ int openrac_game_ui_quad(const openrac_game_ui_rect* quad);
  * a side of the screen are moved out past that side: the width a wider picture gained there when
  * the player's HUD setting is "Edges", else 0. */
 int openrac_game_hud_side(void);
+
+/* Whether the player turned lock-strafe on (settings lock_strafe; rac1: host/strafe.c): while a
+ * weapon is fired the hero keeps facing the camera's way and the stick moves him sideways and
+ * back. 0 without a window (no settings) or with the option off, the game's own movement. */
+int openrac_game_lock_strafe(void);
 
 /* A live particle the game's particle renderer would draw (rac1: PartProc): its 0x40-byte record
  * (+0x01 bits 0-1 the render kind: 0 camera-facing sprite, 1 flat quad, 2 line, 3 ribbon; +0x03
