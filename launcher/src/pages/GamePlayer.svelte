@@ -8,11 +8,12 @@
   import CrashNotice from "$components/CrashNotice.svelte";
   import DeveloperPanel from "$components/DeveloperPanel.svelte";
   import Icon from "$components/Icon.svelte";
+  import JobProgress from "$components/JobProgress.svelte";
   import Menu, { type MenuItem } from "$components/Menu.svelte";
   import ReportsBlock from "$components/ReportsBlock.svelte";
   import SaveManagerBlock from "$components/SaveManagerBlock.svelte";
   import { api, type ActionView } from "$lib/api";
-  import { app, currentVersion, guard, run, uninstallGame } from "$lib/app.svelte";
+  import { app, clock, currentVersion, dismissCrashes, guard, run, uninstallGame } from "$lib/app.svelte";
   import { isBuilt, playerAct, playerState, playerVersion } from "$lib/player.svelte";
   import { themeStyle } from "$lib/themes";
 
@@ -137,13 +138,25 @@
           </button>
           <Menu items={menu} />
         </div>
-        {#if next.hint}<p class="line" class:clip={!!next.job}>{next.hint}</p>{/if}
+        {#if next.hint && !next.job}<p class="line">{next.hint}</p>{/if}
         {#if !app.stopped && recentCrashes > 0}
-          <button class="crashed" onclick={showLogs}>
-            <Icon name="warn" size={15} />Crashed recently: send us the report
-          </button>
+          <span class="crashed">
+            <button class="send" onclick={showLogs}>
+              <Icon name="warn" size={15} />Crashed recently: send us the report
+            </button>
+            <button
+              class="x"
+              onclick={() => void dismissCrashes(v.game)}
+              aria-label="Dismiss: hide this until the game crashes again"
+              title="Dismiss: hide this until the game crashes again"
+            >
+              <Icon name="x" size={14} />
+            </button>
+          </span>
         {/if}
       </div>
+
+      {#if next.job}<JobProgress job={next.job} now={clock.now} />{/if}
 
       {#if showSteps}
         <ol class="steps" aria-label="Setting the game up">
@@ -338,16 +351,42 @@
     gap: 12px;
   }
 
+  /* The way to the report, and a small cross that puts it away until the next crash. */
   .crashed {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 14px;
-    font-size: 14px;
+    max-width: 100%;
     color: var(--err);
     background: rgb(18 18 26 / 0.7);
     border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
     border-radius: 999px;
+  }
+
+  .crashed button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: inherit;
+    background: none;
+    border: 0;
+    font-size: 14px;
+  }
+
+  .crashed .send {
+    padding: 6px 6px 6px 14px;
+    border-radius: 999px 0 0 999px;
+  }
+
+  .crashed .x {
+    align-self: stretch;
+    padding: 0 12px 0 6px;
+    border-radius: 0 999px 999px 0;
+    opacity: 0.8;
+  }
+
+  .crashed button:hover {
+    filter: brightness(1.2);
+    opacity: 1;
   }
 
   .line {
