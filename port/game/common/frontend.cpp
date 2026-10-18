@@ -2163,8 +2163,15 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
         if (const openrac_front_end* fe = openrac_game_front_end) {
             // The first pad's block: +0x100 the sticks, +0x194 its socket, +0x198 its state,
             // +0x1A0 the buttons held, +0x1A4 the raw word.
-            log::info("  mode {} dialog kind {} step {} level word {} title exit {} pad {:#x}",
-                      static_cast<int>(word_at(ram, fe->game_mode)), static_cast<int>(word_at(ram, fe->dialog)),
+            // The level's own game mode (openrac_game_mode: rac1's level copy of its mode word, 6 in
+            // the ship's landing, 2 in a cutscene, 0 in play), or -1 outside a level.
+            std::uint32_t level_mode = 0xFFFFFFFFu;
+            if (openrac_game_mode == nullptr || openrac_game_mode(&level_mode) == 0) {
+                level_mode = 0xFFFFFFFFu;
+            }
+            log::info("  mode {} level mode {} dialog kind {} step {} level word {} title exit {} pad {:#x}",
+                      static_cast<int>(word_at(ram, fe->game_mode)), static_cast<int>(level_mode),
+                      static_cast<int>(word_at(ram, fe->dialog)),
                       static_cast<int>(word_at(ram, fe->dialog + 0x1C)), static_cast<int>(word_at(ram, fe->level)),
                       static_cast<int>(word_at(ram, fe->title_exit)), word_at(ram, fe->pad + 0x1A4));
             float axes[4]{};
@@ -2802,13 +2809,14 @@ bool pad(int port, std::uint16_t* buttons, std::uint8_t analog[4]) {
             at = at ? at + 1 : nullptr;
         }
     }
-    // Start skips an in-game cutscene: the game skips one on Start with L1, L2, R1 and R2 held
-    // (Start alone only once it is beaten; ReRAC cutscenes_transitions.md, "skip"), so while one
-    // plays a pressed Start also presses the four shoulders. Bits are active low: 0x8 Start,
-    // 0x0F00 L2 R2 L1 R1.
+    // Start skips an in-game scene the way the game itself skips it: a pressed Start also presses
+    // what the game's own skip of the scene playing reads (rac1: in a cutscene the four shoulders,
+    // since the game skips one on Start with L1, L2, R1 and R2 held, Start alone only once it is
+    // beaten, ReRAC cutscenes_transitions.md, "skip"; in the ship's landing and take-off Cross).
+    // Bits are active low: 0x8 Start, 0x4000 Cross, 0x0F00 L2 R2 L1 R1.
     if (port == 0 && settings::get().skip_cutscenes && (*buttons & 0x8) == 0) {
-        if (openrac_game_in_cutscene != nullptr && openrac_game_in_cutscene() != 0) {
-            *buttons = static_cast<std::uint16_t>(*buttons & ~0x0F00);
+        if (openrac_game_skip_buttons != nullptr) {
+            *buttons = static_cast<std::uint16_t>(*buttons & ~(openrac_game_skip_buttons() & 0xFFFF));
         }
         if (openrac_game_skip != nullptr) {
             openrac_game_skip();
