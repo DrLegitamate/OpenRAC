@@ -251,17 +251,13 @@ export function playerState(game: GameView, v: VersionView): PlayerState {
     };
   }
   if (play.runnable) {
-    // Play never builds: an outdated game is only pointed at Rebuild the game, in the menu.
-    const rebuild = action(v, "port-rebuild");
+    // Play never builds: an outdated game is recommended a rebuild, in a notice on its page.
     return {
       ...base,
       kind: "play",
       label: "Play",
       icon: "play",
-      hint:
-        v.portOutdated && rebuild?.runnable
-          ? "OpenRAC was updated since this game was built. Rebuild the game, in the menu, to play the new version."
-          : "",
+      hint: "",
       primary: true,
       status: "Ready to play",
       tone: "ok",
@@ -321,7 +317,8 @@ const freshVersion = (v: VersionView) =>
 /**
  * Everything playing still needs, in order: the game built for this computer if it is not built
  * yet, then the levels read and checked (prepareLevels). A game already built is not built again
- * here: only Rebuild the game, in the menu, does that. True when the game can be played.
+ * here: only Rebuild now, in the update notice, or Rebuild the game, in the menu, does that. True
+ * when the game can be played.
  */
 export async function prepare(v: VersionView): Promise<boolean> {
   const scope = { kind: "version" as const, key: v.key };
