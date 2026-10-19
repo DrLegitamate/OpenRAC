@@ -52,6 +52,7 @@ from pathlib import Path
 
 import asm
 import ctype
+import retail
 from lower import FnReport, Unit, UnitReport, Unsupported, _Fn, hexaddr, LEVEL_NAME
 from program import Function, Program, Signature, canon, cname, prototype
 
@@ -60,10 +61,12 @@ FARG_REGS = list(range(12, 20))   # $f12-$f19
 INT_TYPES = set(ctype.INT_NAMES) | {"gaddr"}
 WIDE = {"long long", "unsigned long long", "long", "unsigned long", "long long int", "long int",
         "unsigned long long int", "unsigned long int"}
-SKIP = {"nop", "sync", "pref", "cache", "vnop", "vwaitq", "ssnop"}
+# ei and di only gate the console's interrupts: the port takes none (its handlers run at set
+# points, never in the middle of a function), so they do nothing there, as sync does.
+SKIP = {"nop", "sync", "pref", "cache", "vnop", "vwaitq", "ssnop", "ei", "di"}
 UNSUPPORTED = {
     "syscall": "a system call", "mfc0": "COP0 (mfc0)", "mtc0": "COP0 (mtc0)", "eret": "COP0 (eret)",
-    "ei": "COP0 (ei)", "di": "COP0 (di)", "cop0": "COP0", "vcallms": "a VU0 microprogram (vcallms)",
+    "cop0": "COP0", "vcallms": "a VU0 microprogram (vcallms)",
     "vcallmsr": "a VU0 microprogram (vcallmsr)", "vclipw": "VU0 clipping (vclipw)",
     "bc0f": "COP0 branch", "bc0t": "COP0 branch", "bc0fl": "COP0 branch", "bc0tl": "COP0 branch",
     "bc2f": "VU0 branch", "bc2t": "VU0 branch", "bc2fl": "VU0 branch", "bc2tl": "VU0 branch",
@@ -133,7 +136,7 @@ class Translator:
         return -1
 
     def find(self, f: Function) -> tuple[int, int] | None:
-        return self.index.find([f.symbol], self.program.code_places(f.symbol))
+        return self.index.find([f.symbol], self.program.code_places(f.symbol), own=f.asm)
 
     # ---- One function ----
 
@@ -652,11 +655,11 @@ class Translator:
                     raise AsmUnsupported(f"a call to {sym} with more than eight float arguments")
                 out.append(f"f{FARG_REGS[nf]}")
                 nf += 1
-            elif c in INT_TYPES or c in WIDE:
-                if ni < len(ARG_REGS):
-                    out.append(f"({c}){self.R(ARG_REGS[ni])}")
-                else:
-                    out.append(f"({c})openrac_ee_ld((openrac_u32)r29 + {8 * (ni - len(ARG_REGS))}u)")
+            elif c in INT_TYPES or c in WIDE or c == "double":
+                reg = (self.R(ARG_REGS[ni]) if ni < len(ARG_REGS)
+                       else f"openrac_ee_ld((openrac_u32)r29 + {8 * (ni - len(ARG_REGS))}u)")
+                # A double is a doubleword in an integer register (the EE's soft float).
+                out.append(f"openrac_ee_d({reg})" if c == "double" else f"({c}){reg}")
                 ni += 1
             else:
                 raise AsmUnsupported(f"a call to {sym}, which takes {c or 'a record'}")
@@ -673,6 +676,8 @@ class Translator:
             return pre + [f"f0 = {call};"] + post
         if ret in WIDE:
             return pre + [f"r2 = (openrac_u64)({call});"] + post
+        if ret == "double":
+            return pre + [f"r2 = openrac_ee_dbits({call});"] + post
         if ret in INT_TYPES:
             return pre + [f"r2 = {S32(f'({ret})({call})')};"] + post
         raise AsmUnsupported(f"a call whose result is {ret}")
@@ -686,8 +691,21 @@ class Translator:
         params = ["openrac_u64"] * 8 + (["float"] * 8 if floats else [])
         args = [self.R(r) for r in ARG_REGS] + ([f"f{r}" for r in FARG_REGS] if floats else [])
         t = f"{ret} (*)({', '.join(params)})"
-        callee = f"GFN({t}, {value})" if self.mode == "host" else f"(({t})({value}))"
-        return self._invoke(f"{callee}({', '.join(args)})", ret)
+        if self.mode != "host":
+            return self._invoke(f"(({t})({value}))({', '.join(args)})", ret)
+        cast = self._invoke(f"GFN({t}, {value})({', '.join(args)})", ret)
+        # Where an argument's position decides its register whatever its type (Windows x64), the
+        # cast would put the floats in the wrong place: each function's thunk gives the registers
+        # to its parameters instead (guest.h, openrac_guest_call_regs).
+        ints = ", ".join(f"(openrac_u64){self.R(r)}" for r in ARG_REGS)
+        fl = ", ".join(f"f{r}" if floats else "0.0f" for r in FARG_REGS)
+        regs = f"{value}, (const openrac_u64[8]){{{ints}}}, (const float[8]){{{fl}}}, &fr_"
+        if ret == "float":
+            body = f"{{ float fr_; (void)openrac_guest_call_regs({regs}, 1); f0 = fr_; }}"
+        else:
+            body = f"{{ float fr_; r2 = {S32(f'(int)openrac_guest_call_regs({regs}, 0)')}; }}"
+        thunked = ["OPENRAC_ASM_CALL();", "OPENRAC_VU0_OUT();", body, "OPENRAC_VU0_IN();"]
+        return ["#if OPENRAC_REGS_THUNKS", *thunked, "#else", *cast, "#endif"]
 
     def _float_writes(self) -> set:
         """The FPU registers the function writes anywhere."""
@@ -726,6 +744,8 @@ class Translator:
             return "return (gaddr)r2;"
         if ret in INT_TYPES or ret in WIDE:
             return f"return ({ret})r2;"
+        if ret == "double":
+            return "return openrac_ee_d(r2);"
         raise AsmUnsupported(f"a result of type {ret}")
 
     # ---- One instruction ----
@@ -1133,8 +1153,9 @@ class Translator:
                 if nf < len(FARG_REGS) and f"f{FARG_REGS[nf]}" in [f"f{n}" for n in fprs]:
                     setup.append(f"    f{FARG_REGS[nf]} = a{k};")
                 nf += 1
-            elif c in INT_TYPES or c in WIDE:
-                value = f"(openrac_u64)a{k}" if c in WIDE else S32(f"(openrac_s32)a{k}")
+            elif c in INT_TYPES or c in WIDE or c == "double":
+                value = (f"openrac_ee_dbits(a{k})" if c == "double" else
+                         f"(openrac_u64)a{k}" if c in WIDE else S32(f"(openrac_s32)a{k}"))
                 if ni >= len(ARG_REGS):
                     # Past the eighth: where the EE's caller put it, a doubleword each above $sp.
                     stacked.append(f"    openrac_ee_sd((openrac_u32)r29 + {8 * (ni - len(ARG_REGS))}u, {value});")
@@ -1247,6 +1268,7 @@ class Stage:
     without_asm: list[str] = field(default_factory=list)
     translator: "Translator | None" = None    # for the console's form (write_console)
     found: dict = field(default_factory=dict)  # name -> (program, address) of its entry
+    retail: str = ""                           # the retail program read for instructions, if any
 
 
 def asm_config(cfg: dict) -> dict | None:
@@ -1254,6 +1276,22 @@ def asm_config(cfg: dict) -> dict | None:
     if not a or not a.get("enabled", False):
         return None
     return a
+
+
+def retail_source(a: dict, program: Program, base: Path) -> "retail.Retail | None":
+    """The retail program hostgen.json's "asm" names, when it is there: "retail": {"image": ISO}
+    (the player's disc image) or {"exe": ELF, "dump": level dumps}, relative to the decompilation
+    the assembly is read from (where its setup puts them) unless absolute; hostgen's
+    --retail-image, --retail-exe and --retail-dump give them instead."""
+    r = a.get("retail") or {}
+    low = (getattr(program, "relocate", None) or [0x15F000])[0]
+    path = lambda key: (base / r[key]) if r.get(key) else None
+    image, exe, dump = path("image"), path("exe"), path("dump")
+    if image is not None and image.is_file():
+        return retail.Retail.from_image(image, low)
+    if exe is not None and exe.is_file():
+        return retail.Retail.from_files(exe, dump if dump is not None and dump.is_dir() else None, low)
+    return None
 
 
 def file_names(cfg: dict) -> list[str]:
@@ -1278,7 +1316,15 @@ def run(program: Program, cfg: dict, source: Path, host_text: str = "") -> tuple
     tr.host_text = host_text
     index = asm.read_index(dirs, tr.overlay_of)
     tr.index = index
-    if not index.blocks:
+    # The retail program's own instructions (retail.py), where the player's executable and level
+    # programs are given: everything the assembly files do not have, or all of it without them.
+    source_of = retail_source(a, program, base)
+    if source_of is not None:
+        index.code = retail.CombinedCode(index.code, retail.RetailCode(source_of, retail.starts_of(program),
+                                                                       source_of.low))
+        index.called |= source_of.called()
+        stage.retail = source_of.label
+    elif not index.blocks:
         return stage, {}
     # A stub whose place has C under another spelling (func_0020C828 for FUN_0020c828) is that C
     # already: calls to it go there (Program.canonical).

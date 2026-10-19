@@ -298,14 +298,73 @@ def write_program_files(program: Program, out: Path, game: str) -> dict:
             fn.append(f"    {{0x{addr:08X}u, (openrac_host_fn){cname(sym)}, \"{sym}\"}},")
         fn.append("};")
         fn.append("")
+    # Each function's thunk, for a call through its address with the EE's registers as they are
+    # (guest.h, openrac_guest_call_regs; where OPENRAC_REGS_THUNKS is on: Windows).
+    thunks = []
+    for sym in sorted({s for entries in tables.values() for _a, s in entries}):
+        text = thunk_text(sym, program.functions[sym], program.typedefs, len(thunks))
+        if text is not None:
+            thunks.append((sym, text))
+    if thunks:
+        fn += ["#if OPENRAC_REGS_THUNKS",
+               "static double thunk_d_(uint64_t b) { double d; memcpy(&d, &b, sizeof d); return d; }",
+               "static uint64_t thunk_bits_(double d) { uint64_t b; memcpy(&b, &d, sizeof b); return b; }"]
+        fn += [text for _sym, text in thunks]
+        fn.append("static const openrac_thunk_entry k_thunks[] = {")
+        fn += [f"    {{(openrac_host_fn){cname(sym)}, thunk_{k}}}," for k, (sym, _t) in enumerate(thunks)]
+        fn += ["};", "#endif", ""]
     fn.append("void openrac_game_register_functions(void) {")
     for overlay in sorted(tables):
         name = "exe" if overlay < 0 else f"overlay_{overlay:02d}"
         fn.append(f"    openrac_guest_register({overlay}, k_{name}, sizeof k_{name} / sizeof k_{name}[0]);")
+    if thunks:
+        fn += ["#if OPENRAC_REGS_THUNKS", "    openrac_guest_register_thunks(k_thunks, sizeof k_thunks / sizeof k_thunks[0]);",
+               "#endif"]
     fn.append("}")
     _write(out / "functions.c", "\n".join(fn) + "\n")
     return {"stubs": stub_count, "unprototyped": unprototyped,
             "addresses": sum(len(v) for v in tables.values())}
+
+
+def thunk_text(sym: str, f: Function, typedefs: dict, k: int) -> str | None:
+    """thunk_<k>: f called with the EE's argument registers, integers from i[] in order and floats
+    from f[], by its definition's parameters; its result as the EE has it (a float in *r). None
+    where a parameter or the result has no form there (a record by value)."""
+    sig = f.sig
+    ret = canon(sig.ret, typedefs)
+    if ret is None or ret in ("long double", "va_list"):
+        return None
+    args: list[str] = []
+    if not sig.prototyped:
+        args = [f"(int)i[{n}]" for n in range(8)]
+    else:
+        ni = nf = 0
+        for p in sig.params:
+            c = canon(p, typedefs)
+            if c is None or c in ("va_list", "long double"):
+                return None
+            if c == "float":
+                args.append(f"f[{nf}]" if nf < 8 else "0.0f")
+                nf += 1
+            elif c == "double":
+                args.append(f"thunk_d_(i[{ni}])" if ni < 8 else "0.0")
+                ni += 1
+            else:
+                args.append(f"({c})i[{ni}]" if ni < 8 else f"({c})0")
+                ni += 1
+        if sig.variadic:
+            args += [f"i[{n}]" for n in range(ni, 8)]
+    call = f"{cname(sym)}({', '.join(args)})"
+    if ret == "void":
+        body = f"{call}; return 0;"
+    elif ret == "float":
+        body = f"*r = {call}; return 0;"
+    elif ret == "double":
+        body = f"return thunk_bits_({call});"
+    else:
+        body = f"return (uint64_t)({call});"
+    return (f"static uint64_t thunk_{k}(const uint64_t* i, const float* f, float* r) {{ "
+            f"(void)i; (void)f; (void)r; {body} }}")
 
 
 def _c_string(text: str | None) -> str:
@@ -423,6 +482,14 @@ def write_report(out: Path, reports: list[UnitReport], program: Program, extra: 
         "assembly_unsupported": dict(sorted(stage.unsupported.items())),
         "assembly_unsupported_reasons": dict(sorted(asm_reasons.items(), key=lambda kv: -kv[1])),
         "without_c_or_assembly": sorted(stage.without_asm),
+        # Each function with no C or with C from its assembly: where it sits, and the spelling with
+        # C its calls go to instead (no_c.py classifies them from this).
+        "without_c_places": {
+            f.symbol: {"places": [[ov, f"{a:08X}"] for ov, a in program.code_places(f.symbol)],
+                       "kind": "asm" if f.asm else "no-c",
+                       **({"other_spelling": program.canonical(f.symbol)}
+                          if program.canonical(f.symbol) != f.symbol else {})}
+            for f in no_c + [program.functions[r.name] for r in stage.translated if r.name in program.functions]},
         **extra,
     }
     summary["call_graph"].update({r.name: sorted(r.report.calls) for r in stage.translated
@@ -542,6 +609,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--asm-source", type=Path, metavar="DIR",
                     help="where the assembly's directories (hostgen.json \"asm\") are, if not in --source: "
                          "a copy of the decompilation the game's setup ran in")
+    ap.add_argument("--retail-image", type=Path, metavar="ISO",
+                    help="with \"asm\" on: read the instructions of the functions with no C from the player's disc "
+                         "image (its executable and every level's program; retail.py), where the assembly files "
+                         "do not have them")
+    ap.add_argument("--retail-exe", type=Path, metavar="ELF",
+                    help="the same from the executable itself (and --retail-dump, the level dumps)")
+    ap.add_argument("--retail-dump", type=Path, metavar="DIR",
+                    help="with --retail-exe: the level dumps (level_NN/manifest.json and its records)")
     ap.add_argument("--asm-console", type=Path, metavar="DIR",
                     help="also write each executable function translated from assembly in the console's "
                          "form, a candidate file each in DIR (for rac1-decomp's tools/fcheck.py)")
@@ -554,6 +629,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg["asm"] = {**cfg["asm"], "enabled": args.asm == "on"}
     if args.asm_source and cfg.get("asm"):
         cfg["asm"] = {**cfg["asm"], "source": str(args.asm_source.resolve())}
+    if cfg.get("asm") and (args.retail_image or args.retail_exe):
+        cfg["asm"] = {**cfg["asm"], "retail": {
+            k: str(v.resolve()) for k, v in (("image", args.retail_image), ("exe", args.retail_exe),
+                                             ("dump", args.retail_dump)) if v}}
     source = args.source.resolve()
     out = args.out.resolve()
     if args.list:
