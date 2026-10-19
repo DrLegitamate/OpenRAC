@@ -684,8 +684,17 @@ void use_level(int number) {
             std::make_unique<viewer::LayerRenderer>(g->scene, static_cast<viewer::Layer>(layer)),
             error
         );
+        // The liquids (the seas and lava the game draws solid) after the ties, where retail's draw
+        // callback list 3 draws them, before the shrubs and mobys (renderer/effects.h).
+        if (static_cast<viewer::Layer>(layer) == viewer::Layer::Ties
+            && g->renderer->add(std::make_unique<renderer::EffectRenderer>("liquids", renderer::EffectPart::Liquids,
+                                                                           renderer::Bucket::Ties),
+                                error) == nullptr) {
+            log::error("liquid renderer: {}", error);
+        }
     }
-    if (g->renderer->add(std::make_unique<renderer::EffectRenderer>(), error) == nullptr) {
+    if (g->renderer->add(std::make_unique<renderer::EffectRenderer>("effects", renderer::EffectPart::Rest), error)
+        == nullptr) {
         log::error("effect renderer: {}", error);
     }
     g->renderer->add(std::move(hud), error);
@@ -2403,6 +2412,18 @@ bool frame(std::span<const std::uint8_t> ram, std::uint32_t chain, std::uint32_t
         // it. Volumes and blockers the levels place as mobys (Veldin's grey box behind the start, the
         // walls of Kalebo III's landing) are such: untextured, they showed as solid grey walls.
         if (!extra && m.address + 0x34 <= ram.size() && (ram[m.address + 0x32] | ram[m.address + 0x33]) == 0) {
+            continue;
+        }
+        // Beyond its draw distance, or wholly behind the eye: MobyProc does not draw it
+        // (viewer::moby_beyond_draw_distance). Pokitaru places two mobys of class 1161 with a turn of -5 pi,
+        // past the reach of the game's sine; their rows come out thousands long and their spheres
+        // thousands of units away, so the game never draws them, while drawn here they covered the
+        // sky in cyan. A moby the game draws with a camera of its own (the menus', the vendor's) is
+        // not the world camera's to cull.
+        if (!extra && world_ran && m.address + 0x34 <= ram.size()
+            && std::none_of(g->moby_cameras.begin(), g->moby_cameras.end(),
+                            [&](const auto& c) { return c.first == m.address; })
+            && viewer::moby_beyond_draw_distance(ram.data() + m.address, state.camera_position, state.forward)) {
             continue;
         }
         if (only_own_camera

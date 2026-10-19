@@ -9,7 +9,9 @@
 //   viewer_test DIR    writes the level into DIR (replacing it)
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stb_image_write.h>
@@ -21,6 +23,7 @@
 #include "renderer/renderer.h"
 #include "renderer_gl_context.h"
 #include "viewer/camera.h"
+#include "viewer/game_state.h"
 #include "viewer/json.h"
 #include "viewer/level.h"
 #include "viewer/level_renderer.h"
@@ -268,16 +271,67 @@ void overrides(const fs::path& dir) {
     fs::remove_all(mods.parent_path());
 }
 
+// A tie texture part-clear all over with no fully clear texel (Novalis's windows: glass at alpha
+// 0x1F in an opaque frame), which the export leaves OPAQUE, takes the cutout passes as the GS draws
+// it (blended); the opaque terrain's material does not.
+void translucent_texels(const fs::path& dir) {
+    const fs::path glass = dir.parent_path() / (dir.filename().string() + "_glass");
+    write_level(glass);
+    const std::uint8_t pane[] = {30, 30, 220, 255, 30, 30, 220, 62, 30, 30, 220, 62, 30, 30, 220, 62};
+    stbi_write_png((glass / "textures" / "tie_0001.png").string().c_str(), 2, 2, 4, pane, 8);
+
+    viewer::LevelData level;
+    std::string error;
+    CHECK(viewer::load_level(glass, level, error));
+    CHECK(level.translucent_images.size() == level.images.size());
+    const auto material_of = [&](viewer::Layer layer) {
+        const auto& instance = level.instances[static_cast<std::size_t>(layer)][0];
+        const int m = level.models[instance.model].primitives[0].material;
+        return level.materials[static_cast<std::size_t>(m)];
+    };
+    CHECK(!material_of(viewer::Layer::Terrain).cutout);
+    CHECK(material_of(viewer::Layer::Ties).cutout);
+    fs::remove_all(glass);
+}
+
+
+// MobyProc's distance cull as the port replays it: a moby whose sphere is past its draw distance
+// along the view, or wholly behind the eye, is not drawn; one with no sphere yet is.
+void moby_draw_distance() {
+    std::uint8_t moby[0x100] = {};
+    const auto place = [&](float x, float y, float z, float r, std::int16_t distance) {
+        const float sphere[4] = {x * 1024.0f, y * 1024.0f, z * 1024.0f, r * 1024.0f};
+        std::memcpy(moby, sphere, sizeof(sphere));
+        std::memcpy(moby + 0x32, &distance, sizeof(distance));
+    };
+    const renderer::Vec3 eye{100.0f, 0.0f, 0.0f};
+    const renderer::Vec3 forward{1.0f, 0.0f, 0.0f};
+    place(150.0f, 30.0f, 0.0f, 1.0f, 64);  // 50 deep, off to the side: drawn
+    CHECK(!viewer::moby_beyond_draw_distance(moby, eye, forward));
+    place(170.0f, 0.0f, 0.0f, 1.0f, 64);  // 70 deep, past 64
+    CHECK(viewer::moby_beyond_draw_distance(moby, eye, forward));
+    place(90.0f, 0.0f, 0.0f, 1.0f, 64);  // behind the eye
+    CHECK(viewer::moby_beyond_draw_distance(moby, eye, forward));
+    place(99.5f, 0.0f, 0.0f, 1.0f, 64);  // the eye inside its sphere
+    CHECK(!viewer::moby_beyond_draw_distance(moby, eye, forward));
+    // Pokitaru's class 1161 placed with a turn of -5 pi: its sphere thousands of units away.
+    place(9286.5f, 5217.6f, 235.1f, 1.08f, 64);
+    CHECK(viewer::moby_beyond_draw_distance(moby, {550.0f, 530.0f, 230.0f}, {0.7f, 0.7f, 0.0f}));
+    place(0.0f, 0.0f, 0.0f, 0.0f, 64);  // no sphere yet
+    CHECK(!viewer::moby_beyond_draw_distance(moby, eye, forward));
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     const fs::path dir =
         argc > 1 ? fs::path(argv[1]) : fs::temp_directory_path() / "openrac_viewer_test";
     json_reader();
+    moby_draw_distance();
     write_level(dir);
     viewer::LevelData level;
     loader(dir, level);
     overrides(dir);
+    translucent_texels(dir);
     if (openrac::test::failures() != 0) {
         return openrac::test::result();
     }
