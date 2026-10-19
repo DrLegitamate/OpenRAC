@@ -5,6 +5,7 @@
 // format to RGBA8, CLUT order, TEXA alpha, the chip's layout for textures
 // uploaded in another format, and the pool's identities and cache. No GL.
 
+#include <algorithm>
 #include <cstdio>
 #include <set>
 #include <vector>
@@ -357,6 +358,11 @@ void glyph_fields() {
     const TextureHandle digits_field = textures.distance_field(digits);
     CHECK(digits_field != digits);
     for (std::uint32_t i = 0; i <= TexturePool::kKeepFrames; ++i) {
+        // The field is drawn (and kept) while the page itself goes unused, so that the page's
+        // handle is the one given again.
+        if (i < TexturePool::kKeepFrames) {
+            CHECK(textures.distance_field(digits) == digits_field);
+        }
         textures.end_frame();
     }
     textures.upload(upload(0x600, gs::kPsmct32, 256, 128, page(40, 60)));
@@ -365,6 +371,105 @@ void glyph_fields() {
     const TextureHandle letters_field = textures.distance_field(letters);
     CHECK(letters_field != digits_field);
     CHECK(textures.image(letters_field).texel(43 * 4, 66 * 4) >> 24 > 0x80);  // inside the new glyph
+}
+
+// Sizes no texture the chip samples can have: an empty image, not an allocation. In 0.8.0 a
+// garbage TEX0 (an unknown format, 32768 x 16384 texels) reached convert(), whose blank image for
+// an unknown format computed w * h * 4 in int: -2^31, which operator new was asked for as
+// 2^64 - 2^31 bytes (std::bad_alloc after 22 minutes on Kerwan, crash report 2026-10-19).
+void absurd_sizes() {
+    const std::vector<std::uint8_t> none;
+    for (const int psm_value : {int{gs::kPsmct32}, int{gs::kPsmct16}, int{gs::kPsmt8}, int{gs::kPsmt4}, 0x3F}) {
+        const auto psm = static_cast<std::uint8_t>(psm_value);
+        const Rgba8Image huge = convert(none, psm, 32768, 16384, {}, kTexa, AlphaScale::Gs);
+        CHECK(huge.width == 0 && huge.height == 0 && huge.pixels.empty());
+        CHECK(convert(none, psm, 1025, 4, {}, kTexa, AlphaScale::Gs).pixels.empty());
+        CHECK(convert(none, psm, 4, 0, {}, kTexa, AlphaScale::Gs).pixels.empty());
+        CHECK(convert(none, psm, -8, 4, {}, kTexa, AlphaScale::Gs).pixels.empty());
+        // The chip's largest is still converted.
+        CHECK(convert(none, psm, 1024, 1024, {}, kTexa, AlphaScale::Gs).pixels.size() == 1024u * 1024u * 4u);
+    }
+    const Rgba8Image negative(-1, 5);
+    CHECK(negative.width == 0 && negative.pixels.empty());
+
+    // The pool, asked for such a texture in a format it does not know (the crash's case), draws
+    // the placeholder.
+    TexturePool textures;
+    const gs::Texa texa{0, false, 0x80};
+    textures.upload(upload(0x100, gs::kPsmct32, 4, 4, std::vector<std::uint8_t>(64, 1)));
+    CHECK(textures.resolve(tex0(0x100, 0x3F, 15, 14), texa) == textures.placeholder());
+    CHECK(textures.resolve(tex0(0x100, 0x3F, 14, 15), texa) == textures.placeholder());
+    CHECK(textures.size() == 1);
+}
+
+// A long session's worth of frames: text whose glyph page changes (the bolt counter, a timer) is
+// drawn as a distance field, and an animated texture's palette cycles. What the pool holds must
+// stay bounded by what the last kKeepFrames frames used. Distance fields were kept for good: every
+// content a glyph page ever had kept a field four times its size until the game was closed.
+void long_session() {
+    TexturePool textures;
+    const gs::Texa texa{0, false, 0x80};
+    // A 32 x 16 page whose glyphs spell the frame's number in binary: a new content every frame.
+    auto page = [](std::uint32_t n) {
+        std::vector<std::uint8_t> pixels(32 * 16 * 4);
+        for (int bit = 0; bit < 16; ++bit) {
+            if ((n >> bit & 1u) == 0) {
+                continue;
+            }
+            const int gx = (bit % 8) * 4;
+            const int gy = (bit / 8) * 8;
+            for (int y = gy + 1; y < gy + 6; ++y) {
+                for (int x = gx + 1; x < gx + 3; ++x) {
+                    pixels[static_cast<std::size_t>((y * 32 + x) * 4 + 3)] = 0x80;
+                }
+            }
+        }
+        return pixels;
+    };
+    const gs::Tex0 glyphs = tex0(0x600, gs::kPsmct32, 5, 4);
+    // An 8-bit texture at 0x680 with its CLUT at 0x6C0, the CLUT sent again each frame with
+    // another colour.
+    textures.upload(upload(0x680, gs::kPsmt8, 16, 16, std::vector<std::uint8_t>(256, 7)));
+    const gs::Tex0 animated = tex0(0x680, gs::kPsmt8, 4, 4, 0x6C0);
+    // An asset whose field is drawn for a while, then not.
+    Rgba8Image font(8, 8);
+    font.set_texel(3, 3, rgba(0x80, 0x80, 0x80, 0x80));
+    const TextureHandle asset = textures.add(font, AlphaScale::Gs, "font");
+    const TextureHandle asset_field = textures.distance_field(asset);
+    CHECK(asset_field != asset);
+
+    constexpr std::uint32_t kFrames = 2000;  // about 33 seconds at 60 a second
+    std::size_t most = 0;
+    for (std::uint32_t frame = 1; frame <= kFrames; ++frame) {
+        textures.upload(upload(0x600, gs::kPsmct32, 32, 16, page(frame)));
+        const TextureHandle text = textures.resolve(glyphs, texa);
+        const TextureHandle field = textures.distance_field(text);
+        CHECK(field != text && textures.image(field).width == 128);
+        std::vector<std::uint8_t> clut = clut256();
+        clut[7 * 4] = static_cast<std::uint8_t>(frame);
+        textures.upload(upload(0x6C0, gs::kPsmct32, 16, 16, clut));
+        const TextureHandle anim = textures.resolve(animated, texa);
+        CHECK(textures.image(anim).texel(0, 0) == rgba(frame & 0xFFu, 255 - 7, 7, 0x80));
+        textures.end_frame();
+        most = std::max(most, textures.size());
+    }
+    // Per frame at most a page, its field and the animated texture, each kept kKeepFrames frames,
+    // and the placeholder and the asset.
+    CHECK(most <= 3 * (TexturePool::kKeepFrames + 1) + 2);
+    CHECK(textures.size() <= 3 * (TexturePool::kKeepFrames + 1) + 2);
+
+    // The asset's field went with the rest, and its handle may be another texture now: asked for
+    // again, it is made again, at the asset's size times four.
+    const TextureHandle again = textures.distance_field(asset);
+    CHECK(again != asset);
+    CHECK(textures.image(again).width == 32 && textures.image(again).height == 32);
+    CHECK(textures.name(again) == "font (distance field)");
+    // A page drawn again after its field was dropped gets a field of its own contents.
+    textures.upload(upload(0x600, gs::kPsmct32, 32, 16, page(1)));
+    const TextureHandle first = textures.resolve(glyphs, texa);
+    const TextureHandle first_field = textures.distance_field(first);
+    CHECK(textures.image(first_field).texel(1 * 4 + 2, 3 * 4) >> 24 > 0x80);  // inside glyph 0
+    CHECK(textures.image(first_field).texel(5 * 4 + 2, 3 * 4) >> 24 < 0x80);  // glyph 1 is off
 }
 
 }  // namespace
@@ -437,6 +542,8 @@ int main() {
     layout();
     pool();
     glyph_fields();
+    absurd_sizes();
+    long_session();
     inside_and_loaded();
     return openrac::test::result();
 }
