@@ -14,7 +14,7 @@ each project.
 |---|---|---|---|---|---|---|
 | [`games/rac1`](../games/rac1) | rac1-decomp | https://github.com/OpenRAC/rac1-decomp | main | `44c05d6b65d1` | 2026-10-20 | GPL-3.0 (third-party parts keep theirs) |
 | [`games/rac1/ntsc`](../games/rac1/ntsc) | Lombyte | https://github.com/lombyte-project/Lombyte | main | `8d22ee2420f4` | 2026-10-20 | MIT (GPL-2.0 and newlib parts) |
-| [`games/rac2/ntsc`](../games/rac2/ntsc) | rac2-decomp | https://github.com/OpenRAC/rac2-gc-decomp | master | `86dbd8523696` | 2026-10-15 | GPL-3.0 |
+| [`games/rac2/ntsc`](../games/rac2/ntsc) | rac2-decomp | https://github.com/OpenRAC/rac2-gc-decomp | master | `8bc9d785bfec` | 2026-10-20 | GPL-3.0 |
 | [`games/rac3/ntsc`](../games/rac3/ntsc) | rac3-uya-decomp | https://github.com/OpenRAC/rac3-uya-decomp | main | `bfd8278e8c73` | 2026-10-07 | GPL-3.0 |
 | [`games/rac4/ntsc`](../games/rac4/ntsc) | rac-deadlocked-decomp | https://github.com/OpenRAC/rac-deadlocked-decomp | main | `dedfcd416a1b` | 2026-10-05 | MIT (GPL libgcc, newlib libm) |
 | [`games/rac5/ntsc`](../games/rac5/ntsc) | rac5-sm-decomp | https://github.com/OpenRAC/rac5-sm-decomp | master | `57b025248ac0` | 2026-10-18 | GPL-3.0 |
@@ -98,6 +98,9 @@ python3 tools/sources.py sync rac1/ntsc    # apply the checkout's new commits to
 A checkout is looked for at the path in `game.json` (for example
 `~/Projects/rac1-decomp-ntsc`), or in `$OPENRAC_SOURCE_RAC1_NTSC`. A hunk
 that touches a line changed here is left as a `.rej` file to resolve by hand.
+After syncing rac2/ntsc, write the port's copy of the names its build derives
+again from a build of that commit
+([port/game/rac2-ntsc](../port/game/rac2-ntsc/README.md#building-and-running)).
 Before committing a sync, check it against the
 [sourcing policy](policy/SOURCING.md), including the removal requests, and
 commit it as one `chore(import)` commit per project, naming the new commit.
