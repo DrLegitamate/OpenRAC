@@ -11,6 +11,7 @@ first, to know each definition (index_unit), before any is translated.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +86,7 @@ class Program:
     symbols: dict[str, int] = field(default_factory=dict)  # other named globals -> address
     typedefs: dict[str, set] = field(default_factory=dict)  # name -> desugared type strings
     host: set = field(default_factory=set)  # functions the port writes by hand (port/game/<game>/)
+    from_assembly: set = field(default_factory=set)  # C left out for C from the instructions (hostgen.json "from_assembly")
     wrap: set = field(default_factory=set)  # translated as <name>__game, called by a host <name>
     aliases: dict = field(default_factory=dict)  # (unit, name) -> symbol, from labels Clang refused
     by_place: dict = field(default_factory=dict)  # (overlay, address) -> the symbol defined there
@@ -549,10 +551,18 @@ def read_catalogue(path: Path, program: Program) -> int:
 
 def read_symbols(path: Path, program: Program) -> int:
     """Named symbols and their addresses from a splat symbol file
-    (`name = 0x00123456; // comment`)."""
+    (`name = 0x00123456; // comment`), or from a JSON table of the values a decompilation's
+    own build derived for names that state no address ({"values": {name: "0x..."}}: Going
+    Commando's build/boot/placed.json)."""
     if not path.exists():
         return 0
     count = 0
+    if path.suffix == ".json":
+        for name, value in json.loads(path.read_text(errors="replace")).get("values", {}).items():
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z_]\w*", name):
+                program.symbols.setdefault(name, int(value, 0))
+                count += 1
+        return count
     for line in path.read_text(errors="replace").splitlines():
         m = _SPLAT_SYMBOL.match(line)
         if m:
