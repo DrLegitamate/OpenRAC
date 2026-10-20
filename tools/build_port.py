@@ -47,8 +47,10 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -127,6 +129,29 @@ def read_cache(build: Path) -> dict[str, str]:
         return parse_cache((build / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace"))
     except OSError:
         return {}
+
+
+def remove_tree(path: Path) -> None:
+    """Deletes the folder PATH and everything in it. Windows refuses to delete a read-only file,
+    and git makes its objects read-only: a dependency CMake cloned into the build folder
+    (_deps/*-src/.git) stopped --clean with "Access is denied". Such a file is made writable and
+    deleted again; one held for a moment (a virus scanner reading an object file just written)
+    is tried again a few times."""
+    def writable_then_again(function, name, _error):
+        for attempt in range(5):
+            try:
+                os.chmod(name, stat.S_IWRITE)
+                function(name)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.5)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable_then_again)
+    else:
+        shutil.rmtree(path, onerror=writable_then_again)
 
 
 def parse_environment(text: str) -> dict[str, str]:
@@ -226,7 +251,16 @@ def commands(
         found = dict(zip(("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_MAKE_PROGRAM"), compilers or ()))
         if python:
             found["Python3_EXECUTABLE"] = python
-        for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_MAKE_PROGRAM", "Python3_EXECUTABLE"):
+        c_compiler = cache.get("CMAKE_C_COMPILER") or found.get("CMAKE_C_COMPILER")
+        if c_compiler and os.name == "nt":
+            # Clang on Windows compiles resources with llvm-rc, beside it. CMake 4.3 finds no
+            # resource compiler for its check projects without being told: SDL's configure checks
+            # stopped with "CMAKE_RC_COMPILER not set".
+            rc = Path(c_compiler).with_name("llvm-rc.exe")
+            if rc.is_file():
+                found["CMAKE_RC_COMPILER"] = rc.as_posix()
+        for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_RC_COMPILER", "CMAKE_MAKE_PROGRAM",
+                    "Python3_EXECUTABLE"):
             value = cache.get(key) or found.get(key)
             if value:
                 configure.append(f"-D{key}={value}")
@@ -392,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.clean and build.exists():
         kept = kept_choices(cache)
         say(f"deleting {build.relative_to(ROOT).as_posix()} to build everything again")
-        shutil.rmtree(build)
+        remove_tree(build)
         cache = {}
     try:
         env, cmake, compilers = prepare(cache)
