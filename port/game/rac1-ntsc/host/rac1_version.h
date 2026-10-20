@@ -53,6 +53,32 @@
 #define RAC1_TYPE_func_001FE540_result int
 /* The sprite's TEX0 (FUN_00200468 here, PAL's func_00200CA0). */
 #define RAC1_TYPE_func_00200CA0_tex0 unsigned long long
+/* The hero's position (PAL gHeroPos D_0013F4D0: the hero record D_0013F450, here 0x0013F350,
+ * plus 0x80), for crash reports (boot.c). */
+#define RAC1_HERO_POS 0x0013F3D0u
+/* The moby update loop (crash_state.c): PAL func_00213C78 is FUN_00212e28 here (its hand C,
+ * hand/functional/FUN_00212e28.c, checked against the US assembly), with the list's head
+ * (FUN_0020d868, kept in D_0015FF24) and the steps before and after each update (FUN_0020d580,
+ * FUN_0020def8). */
+#define func_00213C78 game_FUN_00212e28
+#define func_0020E6B8 game_FUN_0020d868
+#define func_0020E3D0 game_FUN_0020d580
+#define func_0020ED48 game_FUN_0020def8
+#define RAC1_ADDR_0x00160024u 0x0015FF24u
+/* A scene's actors (scene_actors.c): PAL's UpdateWorldObjectAnimation func_00204FC0 is FUN_00204790
+ * here (the NTSC decomp's src/world/animation/update_world_object_animation.c), CreateMoby
+ * func_0020D348 is FUN_0020c4f8 and FlushCache keeps its name; the version map pairs each as `same`
+ * and the data below as `exact`. The US routine takes no parameter, and keeps the model record's
+ * word at +8 at +0x48 of the transfer state (PAL +0x46). */
+#define func_00204FC0 game_FUN_00204790
+#define func_0020D348 game_FUN_0020c4f8
+#define func_00118D80 game_FlushCache
+#define RAC1_TYPE_func_00204FC0_params void
+#define RAC1_TRANSFER_PAD08 0x48
+#define RAC1_ADDR_0x0018CC20u 0x0018CB20u
+#define RAC1_ADDR_0x00160588u 0x00160488u
+#define RAC1_ADDR_0x0013E130u 0x0013E030u
+
 /* ---- generated below ---- */
 
 /* Functions: games/rac1's name, this version's. */

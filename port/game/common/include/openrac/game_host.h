@@ -87,10 +87,24 @@ extern int (*openrac_game_bolts)(void);
 extern int (*openrac_game_skip_buttons)(void);
 
 /* For crash reports (port/common/crash.h), sampled once a frame, when a game installs them (rac1:
- * boot.c): the game's mode word, and where the hero is. Each returns 0 when it has no answer now
- * (no level loaded). */
+ * boot.c): the game's mode word, where the hero is and where the camera is. Each returns 0 when it
+ * has no answer now (no level loaded). */
 extern int (*openrac_game_mode)(uint32_t* mode);
 extern int (*openrac_game_hero_position)(float xyz[3]);
+extern int (*openrac_game_camera_position)(float xyz[3]);
+
+/* For crash reports: the moby whose update was running when the program stopped. */
+typedef struct openrac_game_moby {
+    uint32_t address; /* in game memory */
+    int32_t oclass;   /* its class */
+    float position[3];
+    int32_t uid; /* its id in the level's placements, or -1 */
+} openrac_game_moby;
+
+/* Asked while the report is written, not each frame: from a signal handler, so it only reads game
+ * memory it has checked is there, and allocates nothing. 1 and `out` filled when a moby's update
+ * was running (rac1: boot.c's func_00213C78, the moby update loop), 0 otherwise. */
+extern int (*openrac_game_updating_moby)(openrac_game_moby* out);
 
 /* For OPENRAC_TRACE (frontend.cpp), when a game installs it (rac1: boot.c): the hero's position,
  * rotation (game axes; z the yaw) and state id. 0 when there is none now (no level loaded). */
@@ -104,6 +118,11 @@ extern int (*openrac_game_hero)(float position[3], float rotation[3], int32_t* s
 _Noreturn
 #endif
 void openrac_game_crash(const char* reason);
+
+/* A warning from the game's host C, as one line of the port's log (and so of the session's file a
+ * player sends): something the port did instead of what the console would have (a crash the
+ * console shares, skipped). */
+void openrac_game_warn(const char* message);
 
 /* Called while Start is held with skip_cutscenes on, when a game installs it: skips what the game
  * lets the port skip besides its own cutscenes (rac1/pal: the flight between planets, boot.c). */
@@ -260,6 +279,18 @@ float openrac_game_picture_wider(void);
  * with a forward-firing weapon in hand, always facing the camera's way. 0 without a window (no
  * settings). */
 int openrac_game_strafe_mode(void);
+
+/* A game fix's flag, by its setting key (port/game/<game>/differences.json, kind "fix";
+ * game/common/fixes.h): nonzero while the port's fix is on, 0 for the console's behaviour. The
+ * pointer stays good for the program's life and follows the player's setting, so the code a fix
+ * changes asks once and reads it from then on:
+ *
+ *     static const unsigned char* fix;
+ *     if (!fix) fix = openrac_game_fix("fix_wide_liquids");
+ *     if (*fix) ...
+ *
+ * A key this disc's list does not have reads as always on (and is logged). */
+const unsigned char* openrac_game_fix(const char* key);
 
 /* A live particle the game's particle renderer would draw (rac1: PartProc): its 0x40-byte record
  * (+0x01 bits 0-1 the render kind: 0 camera-facing sprite, 1 flat quad, 2 line, 3 ribbon; +0x03
