@@ -1034,11 +1034,18 @@ fn ensure_linux_desktop_integration() {
         icons_changed |= write_if_changed(&dir.join("openrac-launcher.png"), bytes);
     }
 
+    // An AppImage runs from a mount that is gone when it exits (/tmp/.mount_…): the entry starts
+    // the AppImage file itself, or the menu's launcher started nothing once it was closed. A
+    // package (deb, rpm) puts its own entry in the menu: this one is then only for the taskbar's
+    // icon, hidden, so the menu does not list the launcher twice.
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|path| path.is_file());
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("openrac-launcher"));
+    let packaged = appimage.is_none() && exe_path.starts_with("/usr");
+    let program = appimage.unwrap_or(exe_path);
     let entry = |wm_class: &str, hidden: bool| {
         format!(
-            "[Desktop Entry]\nType=Application\nName=OpenRAC Launcher\nComment=Set up, build and play the decompiled Ratchet & Clank games\nExec=\"{}\"\nIcon=dev.openrac.launcher\nTerminal=false\nCategories=Game;Development;\nStartupNotify=true\nStartupWMClass={}\n{}",
-            exe_path.to_string_lossy(),
+            "[Desktop Entry]\nType=Application\nName=OpenRAC Launcher\nComment=Set up, build and play the decompiled Ratchet & Clank games\nExec={}\nIcon=dev.openrac.launcher\nTerminal=false\nCategories=Game;Development;\nStartupNotify=true\nStartupWMClass={}\n{}",
+            detect::desktop_exec(&program),
             wm_class,
             if hidden { "NoDisplay=true\n" } else { "" }
         )
@@ -1046,7 +1053,7 @@ fn ensure_linux_desktop_integration() {
     let mut entries_changed = false;
     entries_changed |= write_if_changed(
         &app_dir.join("dev.openrac.launcher.desktop"),
-        entry("dev.openrac.launcher", false).as_bytes(),
+        entry("dev.openrac.launcher", packaged).as_bytes(),
     );
     entries_changed |=
         write_if_changed(&app_dir.join("openrac-launcher.desktop"), entry("openrac-launcher", true).as_bytes());
@@ -1073,6 +1080,11 @@ fn ensure_linux_desktop_integration() {
 /// icon when launched from the launcher or directly.
 #[cfg(target_os = "linux")]
 fn ensure_linux_game_desktop_integration(root: &std::path::Path) {
+    // The copy inside an AppImage is mounted afresh at each start: an entry for its game would
+    // name a folder that is gone once the launcher exits.
+    if openrac_launcher_core::appimage::appdir().is_some_and(|appdir| root.starts_with(appdir)) {
+        return;
+    }
     let Ok(home) = std::env::var("HOME") else { return };
     let home_path = PathBuf::from(home);
     let icons_base = home_path.join(".local/share/icons/hicolor");
@@ -1116,8 +1128,8 @@ fn ensure_linux_game_desktop_integration(root: &std::path::Path) {
 
         let make_entry = |wm_class: &str, hidden: bool| {
             format!(
-                "[Desktop Entry]\nType=Application\nName={title}\nComment=Play {title} with OpenRAC\nExec=\"{}\"\nIcon={app_id}\nTerminal=false\nCategories=Game;\nStartupNotify=true\nStartupWMClass={wm_class}\n{}",
-                exe_path.to_string_lossy(),
+                "[Desktop Entry]\nType=Application\nName={title}\nComment=Play {title} with OpenRAC\nExec={}\nIcon={app_id}\nTerminal=false\nCategories=Game;\nStartupNotify=true\nStartupWMClass={wm_class}\n{}",
+                detect::desktop_exec(&exe_path),
                 if hidden { "NoDisplay=true\n" } else { "" }
             )
         };
@@ -1225,6 +1237,25 @@ fn open_with_system(target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// On a screen too small for the window (a 1080p screen at 150 % or 200 %), the window opens at
+/// what the screen has room for and can be made that small (core/src/window.rs).
+#[cfg(desktop)]
+fn fit_to_screen(window: &tauri::WebviewWindow) {
+    let (Ok(Some(monitor)), Ok(size)) = (window.current_monitor(), window.inner_size()) else { return };
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area().size.to_logical::<f64>(scale);
+    let size = size.to_logical::<f64>(scale);
+    let floor =
+        window.config().app.windows.first().and_then(|w| w.min_width.zip(w.min_height)).unwrap_or((960.0, 560.0));
+    if let Some(((width, height), (min_width, min_height))) =
+        openrac_launcher_core::window::fit((size.width, size.height), floor, (area.width, area.height))
+    {
+        let _ = window.set_min_size(Some(tauri::LogicalSize::new(min_width, min_height)));
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+        let _ = window.center();
+    }
+}
+
 // On Android and iOS the launcher is a library the app's activity starts through this entry point.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1234,7 +1265,20 @@ pub fn run() {
     tune_webkit();
     #[cfg(target_os = "linux")]
     ensure_wayland_cursor_fallback();
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default();
+    // A second start while the launcher is open shows the open one's window and goes. Registered
+    // first, as the plugin asks. Without it, on Linux the GTK application id (enableGTKAppId)
+    // handed the second start to the first launcher, which set its window up again and stopped:
+    // "a webview with label `main` already exists".
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+    let builder = builder.plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_opener::init());
     #[cfg(desktop)]
     let builder = builder.plugin(
         tauri_plugin_updater::Builder::new()
@@ -1258,6 +1302,7 @@ pub fn run() {
                 if let Some(icon) = app.default_window_icon() {
                     let _ = window.set_icon(icon.clone());
                 }
+                fit_to_screen(&window);
             }
 
             let config_file = app.path().app_config_dir().ok().map(|dir| dir.join("launcher.json"));
