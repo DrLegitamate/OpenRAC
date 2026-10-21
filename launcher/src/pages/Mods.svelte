@@ -49,9 +49,17 @@
   const folders = (v: VersionView) => {
     if (standalone && app.config?.installDir) {
       const data = `${app.config.installDir}/active/${v.game}/data`;
-      return { projects: `${data}/levels/${v.name}`, packed: `${data}/packed/${v.name}` };
+      return {
+        projects: `${data}/levels/${v.name}`,
+        packed: `${data}/packed/${v.name}`,
+        levels: `${data}/port/${v.name}`,
+      };
     }
-    return { projects: `assets/levels/${v.game}/${v.name}`, packed: `assets/packed/${v.game}/${v.name}` };
+    return {
+      projects: `assets/levels/${v.game}/${v.name}`,
+      packed: `assets/packed/${v.game}/${v.name}`,
+      levels: `assets/port/${v.game}/${v.name}`,
+    };
   };
 
   /** Opens one of those folders: a checkout's through its root, an installed launcher's in the data folder. */
@@ -75,7 +83,10 @@
   /** What the game list says for each game on this tab. */
   function modState(game: GameView): EntryState {
     const v = editable(game);
-    if (!v) return { text: "Not moddable yet", tone: "info" };
+    if (!v) {
+      const pv = playerVersion(game);
+      return pv && playable(pv) ? { text: "Gameplay mods", tone: "ok" } : { text: "Not moddable yet", tone: "info" };
+    }
     if (
       early(v) &&
       v.status.disc.state === "found" &&
@@ -99,6 +110,12 @@
     return byId(picked) ?? (last && editable(last) ? last : null) ?? games.find((g) => editable(g)) ?? games[0] ?? null;
   });
   const v = $derived(shown ? editable(shown) : null);
+  /** The version the game page plays, when it has a port: its gameplay mods need no level editor,
+   *  so an installed launcher without the editor's tools still shows them. */
+  const played = $derived.by(() => {
+    const pv = shown ? playerVersion(shown) : null;
+    return pv && playable(pv) ? pv : null;
+  });
 
   /** Make your own: the level editor, or models and textures. */
   let tab = $state<"levels" | "assets">("levels");
@@ -179,7 +196,11 @@
           </p>
         </div>
 
-        {#if !v}
+        {#if !v && played}
+          <!-- The level editor cannot open it here (an installed launcher without its tools, say), but the
+               game plays: its gameplay mods. -->
+          <PluginsPanel version={played} reload={pluginsReload} onpack={() => (reload += 1)} />
+        {:else if !v}
           <!-- Every game has this page; one the editor cannot open yet says so. -->
           <section class="panel none">
             <h2>Mods are not possible for this game yet</h2>
@@ -252,8 +273,8 @@
               <div class="span">
                 <CommandBox
                   lines={[
-                    `python3 editor/overrides.py stack --into <data>/overrides --out <data>/mods/${v.name} --packed ${dirs.packed} --levels assets/port/${v.game}/${v.name}`,
-                    `openrac-${v.key.replace("/", "-")} --data <data> --levels assets/port/${v.game}/${v.name} --mods <data>/mods/${v.name}`,
+                    `python3 editor/overrides.py stack --into <data>/overrides --out <data>/mods/${v.name} --packed ${dirs.packed} --levels ${dirs.levels}`,
+                    `openrac-${v.key.replace("/", "-")} --data <data> --levels ${dirs.levels} --mods <data>/mods/${v.name}`,
                   ]}
                 />
               </div>
