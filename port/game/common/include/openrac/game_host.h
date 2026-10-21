@@ -274,12 +274,6 @@ int openrac_game_hud_side(void);
  * horizontal tangent is the game's times this. 1 for a 4:3 picture, and without a window. */
 float openrac_game_picture_wider(void);
 
-/* How the player strafes on foot (settings strafe; rac1: host/strafe.c): 0 the game's own turning,
- * 1 hold L2 or R2: the camera swings behind him once, then he faces the camera's way, 2 that and,
- * with a forward-firing weapon in hand, always facing the camera's way. 0 without a window (no
- * settings). */
-int openrac_game_strafe_mode(void);
-
 /* A game fix's flag, by its setting key (port/game/<game>/differences.json, kind "fix";
  * game/common/fixes.h): nonzero while the port's fix is on, 0 for the console's behaviour. The
  * pointer stays good for the program's life and follows the player's setting, so the code a fix
@@ -328,6 +322,10 @@ extern int openrac_game_no_card;
 extern int openrac_game_start_level;
 
 int openrac_game_pad(int port, uint16_t* buttons, uint8_t analog[4]);
+
+/* The mods' pad callbacks (game/common/mods.h, docs/port/MODS.md): each report scePad2Read fills,
+ * `size` bytes at `report`, before the game reads it. Null while no mod asked for one. */
+extern void (*openrac_game_pad_report_hook)(int port, uint8_t* report, int size);
 
 /* The game's text lookup, asked for a text id: the game address of a string of the port's own (the
  * rows it adds to the game's options), or 0 when the id is the game's. */
