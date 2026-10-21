@@ -327,6 +327,21 @@ one exists the page offers Open, not Extract. The other games carry a planned
 `editor-extract` that says what the editor lacks for them
 ([editor/README.md](../../editor/README.md)).
 
+**Native mods** ([docs/port/MODS.md](../../docs/port/MODS.md)) are not
+actions: the launcher manages them itself (`core/src/plugins.rs`), as it does
+the packs' order. Each is a folder in the game's set-up folder,
+`{data}/plugins/<id>/` with its `openrac-mod.json` (format 2), shared by the
+game's discs; `{data}/plugins/plugins.json` is the list the port reads at
+start (order, on or off, settings) and `{data}/plugins/status.json` what the
+port did with each. The launcher checks a mod by the same rules as the port's
+loader before Play (the disc, the mod interface, a library for this system,
+dependencies, conflicts) and shows the port's answer from the last start. Every
+`play` action names the list for the port, `--plugins {data}/plugins/plugins.json`,
+or, in Purist mode, `--no-mods` instead (`Action::plan`), so the port never
+guesses where the launcher keeps it: the same in an installed launcher, whose
+own folder is read-only, and in a checkout. A data pack added on the Mods tab still goes through
+`overrides-add`.
+
 ### 9. Release and CI
 
 CI runs the launcher's checks (the `launcher` job in
