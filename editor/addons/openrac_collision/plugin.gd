@@ -97,6 +97,7 @@ func _enter_tree() -> void:
 	dock.plugin = self
 	add_dock(dock)
 	set_input_event_forwarding_always_enabled()
+	set_force_draw_over_forwarding_enabled()
 	reload_timer = Timer.new()
 	reload_timer.one_shot = true
 	reload_timer.wait_time = 0.4
@@ -195,6 +196,10 @@ func redraw() -> void:
 		# The copy stands where the class's node is, seen from the overlay (under Game in a level).
 		copy.transform = root.transform.affine_inverse() * LevelFaces.relative(layer, root.get_parent())
 
+		# The selected object's collision sits inside or on its model: drawn over it to be seen.
+		if is_selected_layer(layer):
+			draw_on_top(copy)
+
 
 ## The class collision nodes to draw: every moby's when shown, else the selected moby's, and the
 ## class scene's own.
@@ -225,6 +230,34 @@ func class_layers_to_show() -> Array[Node3D]:
 			out.append(layer)
 
 	return out
+
+
+## Whether a class collision node is the selection's: the selected moby's, itself or a part's.
+func is_selected_layer(layer: Node3D) -> bool:
+	return (selected_node != null and is_instance_valid(selected_node)
+		and (selected_node == layer or selected_node == layer.get_parent() or selected_node.get_parent() == layer))
+
+
+## Draws a class collision copy over everything, in its own colours.
+func draw_on_top(copy: Node3D) -> void:
+	for found in copy.find_children("*", "MeshInstance3D", true, false):
+		var view := found as MeshInstance3D
+
+		# A mesh instance without a mesh draws nothing.
+		if view.mesh == null:
+			continue
+
+		for surface in view.mesh.get_surface_count():
+			var material := view.get_active_material(surface) as BaseMaterial3D
+
+			# Only the export's standard materials are known to take the flag.
+			if material == null:
+				continue
+
+			var top := material.duplicate() as BaseMaterial3D
+			top.no_depth_test = true
+			top.render_priority = 1
+			view.set_surface_override_material(surface, top)
 
 
 ## A mesh instance for the overlay.
@@ -321,7 +354,7 @@ func pick_at(camera: Camera3D, at: Vector2, is_adding: bool, is_connected: bool)
 	place = hit[0]
 	dock.show_place(place)
 	var picked := PackedInt32Array([face])
-	faces.select(faces.connected(picked) if is_connected else picked, is_adding or is_connected)
+	faces.select(faces.connected(picked) if is_connected else picked, is_adding)
 	refresh_selection()
 
 
@@ -599,9 +632,16 @@ func mesh_part(triangles: PackedVector3Array, kind: int) -> Node3D:
 	file.store_string(ClassCollision.mesh_gltf(triangles, kind))
 	file.close()
 	var filesystem := EditorInterface.get_resource_filesystem()
-	filesystem.scan()
-	await filesystem.filesystem_changed
-	var scene := load(path) as PackedScene
+
+	# A folder the editor has not seen yet is scanned first, so that the file can be added to it.
+	if filesystem.get_filesystem_path(folder) == null:
+		filesystem.scan()
+		await filesystem.filesystem_changed
+
+	# A scan only finds the file; its import is what makes it loadable, and that runs here.
+	filesystem.update_file(path)
+	filesystem.reimport_files(PackedStringArray([path]))
+	var scene := ResourceLoader.load(path, "PackedScene", ResourceLoader.CACHE_MODE_REPLACE) as PackedScene
 
 	# The import may not be done yet in a busy editor: the file stays, and a second press uses a new one.
 	if scene == null:
@@ -746,7 +786,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 	return AFTER_GUI_INPUT_PASS
 
 
-func _forward_3d_draw_over_viewport(viewport_control: Control) -> void:
+func _forward_3d_force_draw_over_viewport(viewport_control: Control) -> void:
 	# Only a box being dragged is drawn over the view.
 	if is_dragging:
 		var rect := Rect2(drag_from, drag_to - drag_from).abs()

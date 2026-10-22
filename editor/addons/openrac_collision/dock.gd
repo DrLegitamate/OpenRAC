@@ -18,6 +18,9 @@ var plugin: EditorPlugin
 ## What the open scene is, in a line.
 var status_label: Label
 
+## The level's tools (see, select, edit, add), hidden in a scene without the level's collision.
+var level_box: VBoxContainer
+
 ## Shows the collision over the level.
 var show_toggle: CheckButton
 
@@ -107,10 +110,14 @@ func _init() -> void:
 	help_text.custom_minimum_size.x = TEXT_WIDTH
 	box.add_child(help_text)
 
-	build_view(box)
-	build_selection(box)
-	build_edit(box)
-	build_add(box)
+	level_box = VBoxContainer.new()
+	box.add_child(level_box)
+	build_view(level_box)
+	build_selection(level_box)
+	build_edit(level_box)
+	build_add(level_box)
+	# The report is outside the level's tools: a class scene's edits report there too.
+	report_label = wrapped(box, "")
 	build_object(box)
 	show_level(null)
 	show_object({})
@@ -143,8 +150,8 @@ func build_selection(box: VBoxContainer) -> void:
 	box.add_child(pick_toggle)
 	needs.level.append(pick_toggle)
 	wrapped(box, "Click a face to select it, Shift-click to add or take one out, drag for a box, "
-		+ "Alt-click for the connected faces of its surface. Selecting a tie or shrub selects the "
-		+ "collision baked inside its bounds.")
+		+ "Alt-click for the connected faces of its surface (Shift-Alt-click adds them). Selecting a "
+		+ "tie or shrub selects the collision baked inside its bounds.")
 	var row := HBoxContainer.new()
 	box.add_child(row)
 	needs.selection.append(button(row, "Connected, same surface", handle_connected_pressed))
@@ -194,7 +201,6 @@ func build_add(box: VBoxContainer) -> void:
 	wrapped(box, "New faces take the surface id, sound class and exclusion above. A mesh is simplified until "
 		+ "every 4-unit cell keeps under 255 corners.")
 	needs.level.append(button(box, "Check the limits", handle_check_pressed))
-	report_label = wrapped(box, "")
 
 
 ## The object (moby class) tools.
@@ -283,17 +289,19 @@ func show_level(faces) -> void:
 	for row in legend.get_children():
 		row.queue_free()
 
-	# A scene without the level's editable collision: say why, and leave the level tools off.
+	# A scene without the level's editable collision: say why, and hide the level tools.
 	if faces == null:
-		status_label.text = ("This scene has no level collision to edit: open a level scene "
-			+ "(levels/level_NN/level_NN.tscn), or a class scene (mobys/moby_<class>.tscn) for an "
-			+ "object's collision.")
+		status_label.text = ("This scene has no level collision: the level's tools are in a level scene "
+			+ "(levels/level_NN/level_NN.tscn). In a class scene (mobys/moby_<class>.tscn), its object "
+			+ "collision is edited below.")
+		level_box.visible = false
 		enable("level", false)
 		enable("selection", false)
 		enable("place", false)
 		enable("mesh", false)
 		return
 
+	level_box.visible = true
 	var counts: Dictionary = faces.kinds_present()
 	var by_surface: Dictionary = {}
 
@@ -328,6 +336,7 @@ func legend_row(colour: Color, text: String) -> void:
 	var swatch := ColorRect.new()
 	swatch.color = colour
 	swatch.custom_minimum_size = SWATCH
+	swatch.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	row.add_child(swatch)
 	var label := Label.new()
 	label.text = text
@@ -371,7 +380,8 @@ func show_selection(faces, selected: PackedInt32Array) -> void:
 	for surface in surfaces:
 		parts.append("surface %d (%d)" % [surface, surfaces[surface]])
 
-	var text: String = "%d faces selected: %s." % [selected.size(), ", ".join(parts)]
+	var text: String = "%d faces selected" % selected.size()
+	text += (": %s." % ", ".join(parts)) if not parts.is_empty() else "."
 
 	# Sound classes and exclusion only for faces with a type byte.
 	if not sounds.is_empty():
