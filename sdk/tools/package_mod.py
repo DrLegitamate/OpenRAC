@@ -63,6 +63,46 @@ def bind_problem(value, most: int = 2) -> str | None:
     if len(names) > most:
         return f"has {len(names)} binds, more than {most}"
     return None
+# Each game's hook points (MODS.md, section 4): bindings/<game>.ids.lock beside this tool in the SDK,
+# a stable id per line with every alias it has had. A manifest's "hooks" may name either.
+_BINDINGS = Path(__file__).resolve().parent.parent / "bindings"
+HOOK_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HOOK_ID = re.compile(r"^[a-z0-9]+(\.[a-z0-9_]+)+$")
+
+
+def hook_names(game: str, bindings: Path | None = None) -> frozenset[str] | None:
+    """Every name `game`'s hook points answer to (their ids and aliases), or None when this SDK has
+    no table for it."""
+    lock = (bindings or _BINDINGS) / f"{game}.ids.lock"
+    if not GAME.match(game) or not lock.is_file():
+        return None
+    names = set()
+    for line in lock.read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            cols = line.split("\t")
+            names.add(cols[0])
+            names.update(a for a in (cols[2].split(",") if len(cols) > 2 else []) if a)
+    return frozenset(names)
+
+
+def _check_hooks(hooks, games, errors: list[str], bindings: Path | None = None) -> None:
+    """"hooks": the hook points the mod takes, each by its stable id (rac1.player.take_damage) or an
+    alias (Hero_TakeDamage). One of the mod's games must have it, when this SDK has that game's table."""
+    if hooks is None:
+        return
+    if not isinstance(hooks, list) or not all(isinstance(h, str) and (HOOK_NAME.match(h) or HOOK_ID.match(h))
+                                               for h in hooks):
+        errors.append("hooks: a list of hook points, by id (rac1.player.take_damage) or alias (Hero_TakeDamage)")
+        return
+    tables = [hook_names(g, bindings) for g in (games if isinstance(games, dict) else {})]
+    known = [t for t in tables if t is not None]
+    if not known:
+        return
+    for h in hooks:
+        if not any(h in t for t in known):
+            errors.append(f"hooks: {h} is not a hook point of {', '.join(sorted(games))} (docs/reference/hooks-<game>.md)")
+
+
 # Files for people, carried beside the manifest.
 EXTRAS = re.compile(r"^(README|LICENSE|COPYING)", re.IGNORECASE)
 
@@ -149,9 +189,34 @@ def _check_setting(i: int, s, errors: list[str]) -> None:
             errors.append(f"{where}: the default is longer than max_length")
 
 
+def value_problem(s: dict, value) -> str | None:
+    """Why `value` is not one the setting `s` (a valid one) takes, or None."""
+    kind = s.get("type")
+    if kind == "bool":
+        return None if isinstance(value, bool) else "is not true or false"
+    if kind in ("int", "float"):
+        if not (isinstance(value, int) and not isinstance(value, bool) if kind == "int" else _number(value)):
+            return f"is not {'an integer' if kind == 'int' else 'a number'}"
+        lo, hi = s.get("min"), s.get("max")
+        if (lo is not None and value < lo) or (hi is not None and value > hi):
+            return "is out of range"
+        return None
+    if kind == "choice":
+        values = [c.get("value") for c in s.get("choices", []) if isinstance(c, dict)]
+        return None if isinstance(value, str) and value in values else "is not one of the choices"
+    if kind == "string":
+        if not isinstance(value, str):
+            return "is not text"
+        m = s.get("max_length")
+        return "is longer than max_length" if isinstance(m, int) and len(value) > m else None
+    if kind == "keybind":
+        return bind_problem(value, s.get("binds", 2) if isinstance(s.get("binds"), int) else 2)
+    return "is of no setting type"
+
+
 def _check_presets(presets, settings: dict, errors: list[str]) -> None:
     """"presets" (interface 1.2): [{id, name, values: {key: value}}], buttons in the launcher that
-    set several keybind settings at once. Each value is one its keybind takes."""
+    set several settings at once, of any type. Each value is one its setting takes."""
     if presets is None:
         return
     if not isinstance(presets, list):
@@ -167,10 +232,10 @@ def _check_presets(presets, settings: dict, errors: list[str]) -> None:
         ids.append(p["id"])
         for key, value in p["values"].items():
             s = settings.get(key)
-            if s is None or s.get("type") != "keybind":
-                errors.append(f"preset {p['id']}: {key} is not a keybind setting of the mod")
+            if s is None:
+                errors.append(f"preset {p['id']}: {key} is not a setting of the mod")
                 continue
-            why = bind_problem(value, s.get("binds", 2) if isinstance(s.get("binds"), int) else 2)
+            why = value_problem(s, value)
             if why:
                 errors.append(f"preset {p['id']}: {key} {why}")
     if len(set(ids)) != len(ids):
@@ -191,9 +256,10 @@ def _check_refs(name: str, refs, errors: list[str], version: bool) -> None:
             errors.append(f"{name} {r['id']}: reason is not text")
 
 
-def check_manifest(m, root: Path | None = None) -> list[str]:
+def check_manifest(m, root: Path | None = None, bindings: Path | None = None) -> list[str]:
     """The rules a manifest breaks (none: an empty list). With `root`, the plugin files must be
-    there for the platforms the manifest lists."""
+    there for the platforms the manifest lists. `bindings`: where the games' hook tables are
+    (the SDK's bindings/ by default)."""
     errors: list[str] = []
     if not isinstance(m, dict):
         return ["the manifest is not a JSON object"]
@@ -275,10 +341,7 @@ def check_manifest(m, root: Path | None = None) -> list[str]:
                     errors.append(f"plugin {platform}: {path} is not in the mod")
     elif "api" in m and not (isinstance(m["api"], str) and API.match(m["api"])):
         errors.append("api: MAJOR.MINOR")
-    hooks = m.get("hooks")
-    if hooks is not None and not (isinstance(hooks, list) and all(
-            isinstance(h, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", h) for h in hooks)):
-        errors.append("hooks: a list of hook point names")
+    _check_hooks(m.get("hooks"), games, errors, bindings)
     settings = m.get("settings", [])
     if not isinstance(settings, list):
         errors.append("settings: a list")

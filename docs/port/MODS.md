@@ -175,7 +175,7 @@ elsewhere.
 | `api` | yes, with `plugin` | `MAJOR.MINOR`: the interface's version the mod was built against |
 | `games` | yes | at least one game, each with at least one version |
 | `plugin` | no | platform → path inside the mod. Platforms: `macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-arm64`. Without it the mod is data only (not used yet: section 10) |
-| `hooks` | no | the hook points the mod takes. The launcher shows which mods share one; the port warns about a hook a mod takes but does not list |
+| `hooks` | no | the hook points the mod takes, each by its id (`rac1.player.take_damage`) or an alias (`Hero_TakeDamage`; section 4). The launcher shows which mods share one; the port warns about a hook a mod takes but does not list; `package_mod.py` refuses one the SDK's table (`bindings/<game>.ids.lock`) does not have |
 | `settings` | no | the mod's settings (below) |
 | `requires` | no | mods that must be on and load before it; `version` is `>=X.Y.Z`, `=X.Y.Z` or absent |
 | `conflicts` | no | mods it cannot run with; either side may list the other |
@@ -200,9 +200,11 @@ the wheel (`WheelUp`, `WheelDown`, `WheelLeft`, `WheelRight`). The launcher
 shows it as "press a key" buttons and marks an input bound to two keybinds of
 the same `group` (settings without one share the group `""`). The manifest
 may also list `"presets": [{"id", "name", "values": {key: value}}]`: buttons
-over the settings that set several keybinds at once (a keybind a preset does
-not name goes back to its default; the launcher adds a Default button of its
-own).
+over the settings that set several at once, of any type, each value one its
+setting takes. A preset covers the mod's keybinds and every setting one of its
+presets names; of those, the ones it does not name go back to their defaults.
+The launcher adds a Default button of its own, unless a preset's id is
+`default`; the port and `package_mod.py` check the values as the launcher does.
 
 A value that is missing, of the wrong type or out of range is the default
 (the port logs it). Settings count from the game's next start.
