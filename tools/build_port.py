@@ -53,7 +53,6 @@ the preset says. Standard library only.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -66,7 +65,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from openrac_common import digest, paths, proc
+
+ROOT = paths.repo_root()
 PORT = ROOT / "port"
 WINDOWS = os.name == "nt"
 DEFAULT_GAME = "rac1-pal"
@@ -194,13 +195,13 @@ def embree_config(install: Path) -> Path:
 def fetch_embree(dest: Path) -> Path:
     """Embree's source, downloaded once into DEST and checked; the unpacked folder."""
     archive = dest / f"embree-{EMBREE_VERSION}.tar.gz"
-    if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != EMBREE_SHA256:
+    if not archive.is_file() or digest.sha256(archive) != EMBREE_SHA256:
         say(f"downloading Embree {EMBREE_VERSION} ({EMBREE_URL})")
         dest.mkdir(parents=True, exist_ok=True)
         part = archive.with_suffix(".part")
         with urllib.request.urlopen(EMBREE_URL, timeout=120) as response, part.open("wb") as out:
             shutil.copyfileobj(response, out)
-        got = hashlib.sha256(part.read_bytes()).hexdigest()
+        got = digest.sha256(part)
         if got != EMBREE_SHA256:
             part.unlink()
             raise BuildError(f"Embree's source archive has SHA-256 {got}, not {EMBREE_SHA256}")
@@ -350,12 +351,11 @@ def checkout_version() -> str | None:
 
 def checkout_commit() -> str | None:
     """The checkout's commit, or None outside git."""
-    git = shutil.which("git")
-    if git is None:
+    if shutil.which("git") is None:
         return None
-    done = subprocess.run([git, "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
-    commit = done.stdout.strip()
-    return commit if done.returncode == 0 and len(commit) == 40 else None
+    # A failed rev-parse prints nothing on standard output.
+    commit = proc.git(ROOT, "rev-parse", "HEAD", check=False)
+    return commit if len(commit) == 40 else None
 
 
 def write_stamp(build: Path, names: list[str]) -> None:
