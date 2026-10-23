@@ -33,6 +33,8 @@
 #include "enhanced/viewer/hero_shadow.h"
 #include "fps_counter.h"
 #include "frame_pacing.h"
+#include "game/common/frontend/geometry.h"
+#include "game/common/frontend/pacing.h"
 #include "game/common/particle_texture_cache.h"
 #include "openrac/game_host.h"
 #include "openrac/guest.h"
@@ -601,29 +603,6 @@ std::vector<std::uint8_t> direct_packets(std::span<const std::uint8_t> ram, std:
     return gif;
 }
 
-// The game's frame as the TV showed it: 4:3 (the PS2's 512x448 PAL / 512x416 NTSC buffer), the
-// largest such box in the window, centred; the rest of the window is black. As ReRAC's game frame
-// (crates/rc-engine/src/display.rs; ISC License, Copyright (c) 2026 ReRAC contributors): the frame
-// keeps the game's framing whatever the window's shape. `aspect`: a wider picture (the player's
-// setting, settings.h), which shows more of the world to the sides.
-struct Box {
-    int x, y, width, height;
-};
-
-constexpr float kTvAspect = 4.0f / 3.0f;
-
-Box frame_box(int window_width, int window_height, float aspect = kTvAspect) {
-    int width = window_width;
-    int height = aspect == kTvAspect ? width * 3 / 4 : static_cast<int>(std::lround(static_cast<float>(width) / aspect));
-    if (height > window_height) {
-        height = window_height;
-        width = aspect == kTvAspect
-                    ? height * 4 / 3
-                    : std::min(window_width, static_cast<int>(std::lround(static_cast<float>(height) * aspect)));
-    }
-    return {(window_width - width) / 2, (window_height - height) / 2, width, height};
-}
-
 // The picture's shape now: the player's setting, for the window as it is.
 float picture_aspect(int window_width, int window_height) {
     return settings::aspect_ratio(settings::get(), window_width, window_height);
@@ -656,17 +635,6 @@ platform::DisplayMode window_mode(settings::DisplayMode mode) {
         default:
             return platform::DisplayMode::Windowed;
     }
-}
-
-// The size the frame is drawn at for a picture of box_width x box_height window pixels: the
-// player's render scale of it, held to what a texture can be on any card the port runs on.
-void frame_size(int box_width, int box_height, int& width, int& height) {
-    constexpr int kLargest = 8192;
-    const float scale = static_cast<float>(std::clamp(settings::get().render_scale, 25, 400)) / 100.0f;
-    const float fit = std::min(1.0f, static_cast<float>(kLargest)
-                                         / (scale * static_cast<float>(std::max({box_width, box_height, 1}))));
-    width = std::max(1, static_cast<int>(std::lround(static_cast<float>(box_width) * scale * fit)));
-    height = std::max(1, static_cast<int>(std::lround(static_cast<float>(box_height) * scale * fit)));
 }
 
 // Draws `framebuffer` (width x height) into the window's box, black around it; `flip`: its first
@@ -1678,27 +1646,14 @@ double frame_cap() {
                                g->swap != platform::SwapInterval::Immediate, pacing.interval);
 }
 
-// The frames between ticks show the game half a tick late, so that the next tick is ready before
-// the refresh that needs it.
-constexpr double kLagTicks = 0.5;
-
 // The refresh a frame started now is shown at: the first after the frame is drawn.
 std::chrono::steady_clock::time_point next_display(std::chrono::steady_clock::time_point now) {
-    using namespace std::chrono;
-    const auto ready = now + duration_cast<steady_clock::duration>(duration<double>(pacing.cost));
-    if (pacing.interval <= 0.0 || pacing.last_swap.time_since_epoch().count() == 0) {
-        return ready;
-    }
-    const double since = duration<double>(ready - pacing.last_swap).count();
-    const double n = std::max(1.0, std::ceil(since / pacing.interval));
-    return pacing.last_swap + duration_cast<steady_clock::duration>(duration<double>(n * pacing.interval));
+    return shown_at(now, pacing.cost, pacing.interval, pacing.last_swap);
 }
 
 // How far the scene is from the last tick's to the kept one's at that refresh.
 float alpha_at(std::chrono::steady_clock::time_point display) {
-    using namespace std::chrono;
-    const double t = duration<double>(display - pacing.tick).count() / pacing.period.count() - kLagTicks;
-    return static_cast<float>(std::clamp(t, 0.0, 1.0));
+    return tick_alpha(display, pacing.tick, pacing.period);
 }
 
 void swapped(std::chrono::steady_clock::time_point started) {
@@ -1748,8 +1703,7 @@ void swapped(std::chrono::steady_clock::time_point started) {
 
 // Whether the frame cap lets a frame start now (within a millisecond: a sleep wakes that coarsely).
 bool frame_due(std::chrono::steady_clock::time_point now) {
-    return frame_cap() <= 0.0 || pacing.due.time_since_epoch().count() == 0
-           || now + std::chrono::milliseconds(1) >= pacing.due;
+    return frame_may_start(frame_cap(), pacing.due, now);
 }
 
 // OPENRAC_FRAME_COST=N: every N frames drawn (default 200), in the log, what a frame cost on
@@ -1793,74 +1747,18 @@ void slow_frame() {
     }
 }
 
-// A moby's matrix part way from the last tick's to this one's, or this one's when it moved too far
-// or turned too much in a tick to be the same thing moving (a moby slot used again, a teleport).
-bool same_moby(const renderer::Mat4& from, const renderer::Mat4& to) {
-    const float dx = to[12] - from[12], dy = to[13] - from[13], dz = to[14] - from[14];
-    if (dx * dx + dy * dy + dz * dz > 16.0f) {
-        return false;
-    }
-    float dot = 0.0f, la = 0.0f, lb = 0.0f;
-    for (int i = 0; i < 3; ++i) {
-        dot += from[i] * to[i];
-        la += from[i] * from[i];
-        lb += to[i] * to[i];
-    }
-    return la > 0.0f && lb > 0.0f && dot >= 0.7f * std::sqrt(la * lb);
-}
-
-renderer::Mat4 blend_matrix(const renderer::Mat4& from, const renderer::Mat4& to, float t) {
-    const float dx = to[12] - from[12], dy = to[13] - from[13], dz = to[14] - from[14];
-    if (dx * dx + dy * dy + dz * dz > 16.0f) {
-        return to;  // a moby slot used again, a teleport
-    }
-    // Where it is always moves with the blend: a thing carried by another (the wrench in the
-    // hero's hand) turns fast, more in a tick than the same-moby test allows, and one left at this
-    // tick's place while its carrier is drawn part way there runs ahead of the hand. Only its
-    // turning is taken whole when it turned too far to blend its axes.
-    renderer::Mat4 m = to;
-    const int upto = same_moby(from, to) ? 12 : 0;
-    for (int i = 0; i < upto; ++i) {
-        m[i] = from[i] + (to[i] - from[i]) * t;
-    }
-    for (int i = 12; i < 15; ++i) {
-        m[i] = from[i] + (to[i] - from[i]) * t;
-    }
-    return m;
-}
-
-renderer::Vec3 normalised(renderer::Vec3 v) {
-    const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    return l > 0.0f ? renderer::Vec3{v[0] / l, v[1] / l, v[2] / l} : v;
-}
-
-renderer::Vec3 cross(const renderer::Vec3& a, const renderer::Vec3& b) {
-    return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
-}
-
 // The camera part way from the last tick's to this one's (a cut is not blended).
 viewer::GameState blend_camera(const viewer::GameState& from, const viewer::GameState& to, float t) {
     viewer::GameState c = to;
-    const renderer::Vec3& p0 = from.camera_position;
-    const renderer::Vec3& p1 = to.camera_position;
-    const float d2 = (p1[0] - p0[0]) * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1])
-                     + (p1[2] - p0[2]) * (p1[2] - p0[2]);
-    const float turn = from.forward[0] * to.forward[0] + from.forward[1] * to.forward[1]
-                       + from.forward[2] * to.forward[2];
-    if (d2 > 64.0f || turn < 0.7f) {
-        return c;
-    }
-    for (int i = 0; i < 3; ++i) {
-        c.camera_position[i] = p0[i] + (p1[i] - p0[i]) * t;
-    }
-    renderer::Vec3 f, u;
-    for (int i = 0; i < 3; ++i) {
-        f[i] = from.forward[i] + (to.forward[i] - from.forward[i]) * t;
-        u[i] = from.up[i] + (to.up[i] - from.up[i]) * t;
-    }
-    c.forward = normalised(f);
-    c.left = normalised(cross(u, c.forward));
-    c.up = cross(c.forward, c.left);
+    const CameraPose pose = blend_pose(
+        {from.camera_position, from.forward, from.left, from.up},
+        {to.camera_position, to.forward, to.left, to.up},
+        t
+    );
+    c.camera_position = pose.position;
+    c.forward = pose.forward;
+    c.left = pose.left;
+    c.up = pose.up;
     return c;
 }
 
@@ -1954,7 +1852,7 @@ void draw_kept(bool first) {
     // samples a pixel. It is scaled to the box when it is shown (present).
     int width = 0;
     int height = 0;
-    frame_size(box.width, box.height, width, height);
+    frame_size(box.width, box.height, settings::get().render_scale, width, height);
     // How much of the frame's width the game's 4:3 picture is: all of it, or its middle.
     const float picture_scale = aspect > kTvAspect && box.width > 0 && box.height > 0
         ? std::min(1.0f, kTvAspect * static_cast<float>(box.height) / static_cast<float>(box.width)) : 1.0f;
