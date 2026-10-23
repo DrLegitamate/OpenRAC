@@ -7,10 +7,12 @@ Two kinds of test. Each helper's own behaviour, with expected values from its do
 (ECMA-119 for the image, hashlib for the digests). And characterisation: the existing copy each
 helper was written from runs on the same synthetic input as the helper, and both must give the
 same result, so a caller moved onto the package later behaves as it did. Those copies are
-imported from where they live today (sdk/tools, editor, and what tools/ keeps: openrac.checksums,
+imported from where they live today (sdk/tools, and what tools/ keeps: openrac.checksums,
 fcheck_gate.fcheck_commit); once their callers have moved and a copy is gone, its comparison
-goes with it, as tools/' copies went in P1-05 and port/tools' and the probe tools' in P2-10
-(hostgen's readers keep their characterisation in port/tools/hostgen/test_tables.py).
+goes with it, as tools/' copies went in P1-05, port/tools' and the probe tools' in P2-10 and the
+editor's disc reader in P2-32 (hostgen's readers keep their characterisation in
+port/tools/hostgen/test_tables.py; the editor's reader, now on iso9660, keeps its stricter
+checks' tests in editor/test_disc.py).
 """
 import contextlib
 import hashlib
@@ -30,13 +32,12 @@ from openrac_common import digest, files, games, iso9660, paths, proc, tables
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The existing copies' folders go after tools/ on the path, so a tools/ module of the same name
-# (tools/port.py beside editor/port.py) is the one imported.
-for folder in ("sdk/tools", "editor"):
+# The existing copies' folder goes after tools/ on the path, so a tools/ module of the same name
+# would be the one imported.
+for folder in ("sdk/tools",):
     if str(ROOT / folder) not in sys.path:
         sys.path.append(str(ROOT / folder))
 
-import disc  # noqa: E402  editor
 import fcheck_gate  # noqa: E402
 import gen_binding  # noqa: E402  sdk/tools
 import openrac  # noqa: E402
@@ -201,9 +202,13 @@ class PathsTests(TempDir):
             paths.repo_root(self.dir / "x/y")
 
 
-# The folders whose scripts reach the package through paths.BOOTSTRAP (the editor and sdk/tools
-# join them when they move onto it).
-BOOTSTRAPPED = ("port/tools", "port/enhanced/tools/probes")
+# The folders whose scripts reach the package through paths.BOOTSTRAP (sdk/tools joins them when it
+# moves onto it). NAMES_CHECKED are those whose modules must not share a name with one of tools/:
+# the editor imports nothing of tools/ but the package, and its port.py keeps its name beside
+# tools/port.py because a script's own folder comes before tools/ on the path
+# (test_the_editor_runs_from_the_launchers_bundled_copy).
+BOOTSTRAPPED = ("port/tools", "port/enhanced/tools/probes", "editor")
+NAMES_CHECKED = ("port/tools", "port/enhanced/tools/probes")
 
 
 class BootstrapTests(TempDir):
@@ -241,6 +246,31 @@ class BootstrapTests(TempDir):
         self.assertFalse((top / paths.CHECKOUT_MARKER).exists())
         self.assertEqual(self.run_script(top), [top / paths.PACKAGE_DIR, top])
 
+    def test_the_editor_runs_from_the_launchers_bundled_copy(self):
+        # The copy carries editor/ beside tools/ (openrac_common and port.py among them) and
+        # games/*/game.json, without AGENTS.md (tools/bundle_standalone.py). Every module of the
+        # editor imports there, takes the package from the copy, and its own port.py comes first.
+        top = self.layout("bundle", paths.STANDALONE_MARKER).resolve()
+        shutil.copytree(ROOT / "editor", top / "editor", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy(ROOT / "tools/port.py", top / "tools/port.py")
+        for manifest in (ROOT / "games").glob("*/game.json"):
+            (top / "games" / manifest.parent.name).mkdir()
+            shutil.copy(manifest, top / "games" / manifest.parent.name / "game.json")
+        script = top / "editor/probe.py"
+        script.write_text(
+            "import importlib\nfrom pathlib import Path\n"
+            "here = Path(__file__).parent\n"
+            "for name in sorted(p.stem for p in here.glob('*.py') if p.stem != 'probe'):\n"
+            "    importlib.import_module(name)\n"
+            "import assets, disc, port, util\n"
+            "print(Path(util.games.__file__).parent)\nprint(Path(assets.digest.__file__).parent)\n"
+            "print(Path(port.__file__))\nprint(disc.PAL.executable)\n")
+        done = subprocess.run([sys.executable, "-E", str(script)], cwd=self.dir, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), [str(top / paths.PACKAGE_DIR), str(top / paths.PACKAGE_DIR),
+                                                    str(top / "editor/port.py"),
+                                                    games.load("rac1")["versions"]["pal"]["boot"]["file"]])
+
     def test_the_documented_line_is_the_constant(self):
         self.assertIn(paths.BOOTSTRAP, paths.__doc__)
         self.assertIn(paths.BOOTSTRAP, (ROOT / paths.PACKAGE_DIR / "README.md").read_text(encoding="utf-8"))
@@ -250,7 +280,7 @@ class BootstrapTests(TempDir):
         # comes first on the path: hostgen's test assembler, named mips.py like tools/mips.py that
         # versionmap imports, was one (renamed tests/assembler.py in P2-10).
         ours = {script.stem for script in (ROOT / "tools").glob("*.py")}
-        for folder in BOOTSTRAPPED:
+        for folder in NAMES_CHECKED:
             for script in sorted((ROOT / folder).rglob("*.py")):
                 self.assertNotIn(script.stem, ours, script.relative_to(ROOT))
 
@@ -593,14 +623,6 @@ class IsoTests(TempDir):
             with self.subTest(read=read.__name__), self.assertRaises(iso9660.IsoError) as caught:
                 read(cut)
             self.assertEqual(caught.exception.detail, "a directory record is cut short")
-
-    def test_matches_the_editors_disc_reader(self):
-        flat = self.write("flat.iso", build_image({"SYSTEM.CNF": CNF, "SCES_999.99": BOOT, **MANY}))
-        with disc.Disc(flat) as image:
-            theirs = [(r["name"], r["lba"], r["bytes"]) for r in image.files()]
-            boot = disc.BOOT.search(CNF).group(1).decode()
-        self.assertEqual(iso9660.files(flat), theirs)
-        self.assertEqual(iso9660.boot_serial(flat), boot)
 
 
 if __name__ == "__main__":
