@@ -72,7 +72,7 @@ the lanes, one at a time.
 | P2-10 | `port/tools` and the probe tools use `openrac_common`, through one bootstrap; versionmap's `mips` clash | | todo | | |
 | P2-11 | `editor/catalogue.py` moves to `sdk/tools/` | P2-32 | todo | | |
 | P2-12 | Launcher TypeScript types generated with ts-rs (proposal, question 5); `mock.ts` typed on them | P2-34 | todo | | |
-| P2-13 | Source folders for the host program's split (`program/`, `frontend/`, `debug/` globbed) | | todo | | |
+| P2-13 | Source folders for the host program's split (`program/`, `frontend/`, `debug/` globbed) | | done | maintainer | [293f4f43](https://github.com/OpenRAC/OpenRAC/commit/293f4f43), and this page |
 | P2-14 | The test stanzas of `Window.cmake`, `ProbeBake.cmake`, `Assets.cmake` onto the helpers | | todo | | |
 | P2-15 | Split `frontend.cpp` 2/5: input | P2-04 | todo | | |
 | P2-16 | Split `frontend.cpp` 3/5: world submission | P2-15 | todo | | |
@@ -88,7 +88,7 @@ the lanes, one at a time.
 | P2-26 | Split `debug_overlay.cpp` 1/2: internal header and inspection panels | P2-13, P2-22 | todo | | |
 | P2-27 | Split `debug_overlay.cpp` 2/2: drawer, menu bar, controls | P2-26 | todo | | |
 | P2-28 | CI: the touched-line format check fails; the layering check runs | | todo | | |
-| P2-29 | Launcher desktop entries take their titles from game.json | | todo | | |
+| P2-29 | Launcher desktop entries take their titles from game.json | | done | maintainer | [82f85fb8](https://github.com/OpenRAC/OpenRAC/commit/82f85fb8), [f9decb76](https://github.com/OpenRAC/OpenRAC/commit/f9decb76), and this page |
 | P2-30 | Sister checkouts from game.json, with the env override | | todo | | |
 | P2-31 | Intel Macs ship without the probe baker | | todo | | |
 | P2-32 | The editor uses `openrac_common`; `scene_nodes` renamed; one `unit()` | P2-10 | todo | | |
@@ -254,8 +254,8 @@ Found while doing a package, for another package or the maintainers.
 | P1-04 | The rest of rac2's and rac4's host C still repeats itself: `sound.c` (0.76 similar; `rac4_io_test` compiles rac4's), `entry.c`, `movie.c`, `dma.c`, and rac2's `print.c` against `rac1/host/hand.c`. | P3-02 |
 | P1-04 | Going Commando's sine reads -pi from the pair at `0xC98`; Deadlocked's negates pi. If that pair holds exactly -pi, the two are the same and the table's `minus_pi` field can go. Not checked: it needs the game's packet. | the maintainers |
 | P1-07 | The launcher's and the games' Linux desktop entries are written twice: by the launcher (`launcher/core/src/desktop.rs`) and by the port itself (`port/game/common/frontend.cpp`, the window and desktop integration). One writer, or one shared description of the entries, would keep them from disagreeing. | P2-04 |
-| P1-07 | `desktop::game_title` hard-codes the games' menu names, against ARCHITECTURE.md rule 1 (the launcher hard-codes nothing about a game but its colours); the catalogue's titles (`game.json`) could name them. It changes the entries' text, so it is not a refactor. | the launcher |
-| P1-07 | `launcher/README.md`'s "Linux desktop" row lists the launcher's two `.desktop` files only; the launcher also writes two entries and an icon per game of the checkout (`desktop::write_games`). Outside this package's paths. | the next launcher docs change |
+| P1-07 | `desktop::game_title` hard-codes the games' menu names, against ARCHITECTURE.md rule 1 (the launcher hard-codes nothing about a game but its colours); the catalogue's titles (`game.json`) could name them. It changes the entries' text, so it is not a refactor. | done in P2-29 ([82f85fb8](https://github.com/OpenRAC/OpenRAC/commit/82f85fb8)): the entries take the port's name, the game's title and its disc's video standard from game.json |
+| P1-07 | `launcher/README.md`'s "Linux desktop" row lists the launcher's two `.desktop` files only; the launcher also writes two entries and an icon per game of the checkout (`desktop::write_games`). Outside this package's paths. | done in P2-29 ([f9decb76](https://github.com/OpenRAC/OpenRAC/commit/f9decb76)) |
 | P1-07 | `run_action` still holds the Discord glue (the playing status, the planet and bolts from the play job's log, idle when it ends) and `run` the install folder's first-start move (`active/` renamed into `~/OpenRAC`); both are logic for the core, with tests, when `run` is split. | P2-12 |
 | P1-08 | The three `openFolder`s are not copies: Saves opens the card's folder (`api.openSavesFolder`) and toasts the raw error, "Could not open folder: …"; the mods panel opens a mod's folder (`api.openOutput`) and Mods a project folder (`api.openGameFolder` or `api.openPath`), both through `guardShown`, which hides paths. Moving Saves onto `guardShown` would keep paths out of its toast too, but changes its text, so it is not a refactor. | the launcher |
 | P1-08 | `lib/reports.ts`'s `duration` is not the job lists' duration: it writes a play session in words ("1 hour 14 minutes"), from seconds. Kept apart; a name such as `playTime` would tell it from `jobDuration`. | the launcher |
@@ -283,3 +283,6 @@ Found while doing a package, for another package or the maintainers.
 | PR #40 | `rac1-pal/host/crt0.c` and `tlbtrap.c` describe their one function in the file comment only; section 7.2 wants a doc comment on the function. No ctest covers the new kernel answers, `spr_dma.c` or crt0's .bss loop. A C test on synthetic game memory, as `graph_dma_test` does for `graph.c`, would pin them. | rac1's port tests |
 | PR #41 | hostgen translates an empty asm statement's output only when a bare digit constraint ties it to an input. A `+` output, a `%[name]` tie or a constraint such as `"0r"` is reported and stays a barrier, and none of them has a test. | hostgen |
 | PR #37 | `vu_times` (rac1's `game_fastfunc.c`, PAL and NTSC-U) gives zero for a zero exponent as the vector unit does. An overflow or an exponent-255 operand still gives the host's inf or NaN where the console saturates. | the next ps2float change |
+| P2-13 | Section 19 of the conventions asks for no new globs; `cmake/Games.cmake` now globs `game/common/program/`, `frontend/` and `debug/` into the game programs, as the plan's phase 2 asks so that the splits never edit it. They are a program's source folders, not a module's library target; the page could say so beside the library replacements' glob, or each folder gets a target with listed sources once it is a module. | P2-24 |
+| P2-13 | A rebuild after reconfiguring never prints `ninja: no work to do`: `openrac_build_info` runs at every build, and its commit gains `-dirty` once `port/` has changes, which relinks every program. The proof that a CMake change keeps the build is `ninja -C build/<preset> -t commands` before and after, which must be identical. | the briefs of CMake packages |
+| P2-13 | `mod_loader` was killed (`Subprocess killed`, 0.39 s) once in a full `ctest --preset release` run, and passed alone three times and in a second full run; seen once, not investigated. | the maintainers |
