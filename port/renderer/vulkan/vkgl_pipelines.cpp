@@ -7,15 +7,18 @@
 // after which a pipeline made counts as a hitch (vkgl.h, begin_pipeline_warmup).
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 #include <volk.h>
 
 #include "renderer/gl.h"
+#include "renderer/render_opt.h"
 #include "renderer/vulkan/shader_compiler.h"
 #include "renderer/vulkan/vkgl_internal.h"
 #include "renderer/world/gl_world.h"
@@ -139,19 +142,6 @@ VkPrimitiveTopology topology_of(GLenum mode) {
     }
 }
 
-// Everything a pipeline bakes in, as plain numbers: the cache's key.
-struct PipelineKey {
-    std::uint64_t program;
-    std::uint32_t topology, restart, polygon, cull, front;
-    std::uint32_t blend, src_rgb, dst_rgb, src_a, dst_a, equation, colour_mask;
-    std::uint32_t depth_test, depth_write, depth_func;
-    std::uint32_t stencil, stencil_func, front_ops[3], back_ops[3];
-    std::uint32_t colour_format, depth_format, samples;
-    std::uint32_t inputs;
-    std::uint32_t viewports;
-    Input input[kAttributes];
-};
-
 // ---- Descriptors ----
 
 VkDescriptorPool new_pool() {
@@ -189,6 +179,189 @@ BufferRef block_buffer(GLuint binding, int size) {
 }
 
 }  // namespace
+
+// ---- Pipelines by key ----
+
+namespace {
+
+// FNV-1a's 64-bit offset basis and prime (documented: the FNV hash's specification).
+constexpr std::uint64_t kFnvBasis = 0xcbf29ce484222325u;
+constexpr std::uint64_t kFnvPrime = 0x100000001b3u;
+
+// The finaliser of SplitMix64 (documented: Steele, Lea and Flood's SplitMix), which spreads FNV's
+// weak low bits over the whole word before they pick a slot.
+constexpr std::uint64_t kMixFirst = 0xbf58476d1ce4e5b9u;
+constexpr std::uint64_t kMixSecond = 0x94d049bb133111ebu;
+constexpr int kMixShiftFirst = 30;
+constexpr int kMixShiftSecond = 27;
+constexpr int kMixShiftLast = 31;
+
+// The slots PipelineTable starts with, a power of two.
+constexpr std::size_t kFirstSlots = 64;
+
+}  // namespace
+
+std::uint64_t hash_words(std::span<const std::uint64_t> words) {
+    std::uint64_t hash = kFnvBasis;
+
+    // FNV-1a a word at a time rather than a byte: a key is read once a draw.
+    for (const std::uint64_t word : words) {
+        hash = (hash ^ word) * kFnvPrime;
+    }
+
+    hash = (hash ^ (hash >> kMixShiftFirst)) * kMixFirst;
+    hash = (hash ^ (hash >> kMixShiftSecond)) * kMixSecond;
+    return hash ^ (hash >> kMixShiftLast);
+}
+
+std::uint64_t hash_key(const PipelineKey& key) {
+    constexpr std::size_t kWords = sizeof(PipelineKey) / sizeof(std::uint64_t);
+    std::array<std::uint64_t, kWords> words{};
+    std::memcpy(words.data(), &key, sizeof key);
+    return hash_words(words);
+}
+
+const VkPipeline* PipelineTable::find(const PipelineKey& key, std::uint64_t hash) const {
+    // Nothing made yet.
+    if (m_slots.empty()) {
+        return nullptr;
+    }
+
+    const std::size_t mask = m_slots.size() - 1;
+
+    // Linear probing from the hash's slot; a free slot ends the search, and the table is never
+    // more than half full, so one is always reached.
+    for (std::size_t at = hash & mask;; at = (at + 1) & mask) {
+        const std::uint32_t slot = m_slots[at];
+
+        // A free slot: the key was never added.
+        if (slot == 0) {
+            return nullptr;
+        }
+
+        const std::size_t index = slot - 1;
+
+        // A hash match is only a candidate: the whole key decides, so a collision never returns
+        // another key's pipeline.
+        if (m_hashes[index] == hash
+            && std::memcmp(&m_entries[index].first, &key, sizeof key) == 0) {
+            return &m_entries[index].second;
+        }
+    }
+}
+
+const VkPipeline* PipelineTable::find_reference(const std::string& key) const {
+    const auto found = m_reference.find(key);
+    return found != m_reference.end() ? &m_entries[found->second].second : nullptr;
+}
+
+void PipelineTable::insert(const PipelineKey& key, std::uint64_t hash, VkPipeline pipeline) {
+    m_entries.emplace_back(key, pipeline);
+    m_hashes.push_back(hash);
+
+    // The slots are kept at least twice the entries, so a probe meets a free slot soon.
+    if (m_entries.size() * 2 > m_slots.size()) {
+        rebuild();
+        return;
+    }
+
+    const std::size_t index = m_entries.size() - 1;
+    place(index, hash);
+    m_reference.emplace(
+        std::string(reinterpret_cast<const char*>(&m_entries[index].first), sizeof key), index
+    );
+}
+
+void PipelineTable::place(std::size_t index, std::uint64_t hash) {
+    const std::size_t mask = m_slots.size() - 1;
+    std::size_t at = hash & mask;
+
+    // The first free slot from the hash's.
+    while (m_slots[at] != 0) {
+        at = (at + 1) & mask;
+    }
+
+    m_slots[at] = static_cast<std::uint32_t>(index + 1);
+}
+
+void PipelineTable::rebuild() {
+    std::size_t slots = kFirstSlots;
+
+    // The smallest power of two at least twice the entries.
+    while (slots < m_entries.size() * 2) {
+        slots *= 2;
+    }
+
+    m_slots.assign(slots, 0);
+    m_hashes.resize(m_entries.size());
+    m_reference.clear();
+
+    // Each entry into both indexes again.
+    for (std::size_t index = 0; index < m_entries.size(); ++index) {
+        const PipelineKey& key = m_entries[index].first;
+        m_hashes[index] = hash_key(key);
+        place(index, m_hashes[index]);
+        m_reference.emplace(std::string(reinterpret_cast<const char*>(&key), sizeof key), index);
+    }
+}
+
+// ---- A program's descriptor sets by key ----
+
+void DescriptorCache::clear() {
+    words.clear();
+    items.clear();
+    slots.fill(0);
+}
+
+VkDescriptorSet DescriptorCache::find(
+    std::span<const std::uint64_t> key, std::uint64_t hash
+) const {
+    constexpr std::size_t kMask = kSlots - 1;
+
+    // Linear probing from the hash's slot; at most half the slots are full, so one is free.
+    for (std::size_t at = hash & kMask;; at = (at + 1) & kMask) {
+        const std::uint16_t slot = slots[at];
+
+        // A free slot: no set has this key.
+        if (slot == 0) {
+            return VK_NULL_HANDLE;
+        }
+
+        const Item& item = items[slot - 1u];
+        const std::span<const std::uint64_t> held(words.data() + item.at, item.size);
+
+        // The hash picks candidates; the key's words decide.
+        if (item.hash == hash && std::ranges::equal(held, key)) {
+            return item.set;
+        }
+    }
+}
+
+void DescriptorCache::insert(
+    std::span<const std::uint64_t> key, std::uint64_t hash, VkDescriptorSet set
+) {
+    // Full: the reference path stops keeping sets at the same count.
+    if (items.size() >= kCapacity) {
+        return;
+    }
+
+    constexpr std::size_t kMask = kSlots - 1;
+    std::size_t at = hash & kMask;
+
+    // The first free slot from the hash's.
+    while (slots[at] != 0) {
+        at = (at + 1) & kMask;
+    }
+
+    items.push_back(
+        {hash,
+         static_cast<std::uint32_t>(words.size()),
+         static_cast<std::uint32_t>(key.size()),
+         set}
+    );
+    words.insert(words.end(), key.begin(), key.end());
+    slots[at] = static_cast<std::uint16_t>(items.size());
+}
 
 // ---- Pipelines ----
 
@@ -400,9 +573,20 @@ VkPipeline pipeline_for(
     k.inputs = count;
     k.viewports = static_cast<std::uint32_t>(std::max<std::size_t>(1, g->indexed_viewports.size()));
     std::memcpy(k.input, inputs, sizeof(Input) * count);
-    std::string key(reinterpret_cast<const char*>(&k), sizeof k);
-    if (auto it = g->pipelines.find(key); it != g->pipelines.end()) {
-        return it->second;
+    const std::uint64_t hash = hash_key(k);
+
+    // A key made before: by its hash and a compare of the whole key (vk-draw-cache), or by its
+    // bytes as a string, which allocates for every draw (the reference path).
+    if (renderer::render_opt::enabled(renderer::render_opt::Opt::VkDrawCache)) {
+        // Found by its hash.
+        if (const VkPipeline* made = g->pipelines.find(k, hash)) {
+            return *made;
+        }
+    } else if (const VkPipeline* made = g->pipelines.find_reference(
+                   std::string(reinterpret_cast<const char*>(&k), sizeof k)
+               )) {
+        // Found by its bytes.
+        return *made;
     }
 
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -538,7 +722,7 @@ VkPipeline pipeline_for(
         )) {
         pipeline = VK_NULL_HANDLE;
     }
-    g->pipelines.emplace(std::move(key), pipeline);
+    g->pipelines.insert(k, hash, pipeline);
     return pipeline;
 }
 
@@ -602,16 +786,22 @@ Sampled sampled(const Program& p, std::size_t i) {
     return out;
 }
 
-VkDescriptorSet descriptors(Program& p, const std::vector<Sampled>& samplers) {
-    if (p.set_layout == VK_NULL_HANDLE) {
-        return VK_NULL_HANDLE;
-    }
+namespace {
+
+// Forgets program `p`'s sets of an earlier frame and uploads its default uniforms when they
+// changed or the frame is new: the start of descriptors() on either path.
+void begin_program_sets(Program& p) {
     const CompiledProgram& c = p.compiled;
+
+    // A new frame: the sets of the last were made from pools that are reset with their frame.
     if (p.last_set_frame != g->frame_count) {
         // Pools and ring allocations retire together after the frame-slot fence.
         p.descriptor_sets.clear();
+        p.set_cache.clear();
         p.last_set = VK_NULL_HANDLE;
     }
+
+    // The default uniforms go into the frame's ring when they changed, or once a frame.
     if (c.default_binding >= 0 && (p.uniforms_dirty || p.uniforms_frame != g->frame_count)) {
         const Slice s = ring_copy(p.uniforms.data(), static_cast<std::size_t>(c.default_size));
         p.uniforms_buffer = s.buffer;
@@ -621,6 +811,150 @@ VkDescriptorSet descriptors(Program& p, const std::vector<Sampled>& samplers) {
         ++g->submission.uniform_uploads;
         g->submission.uniform_upload_bytes += static_cast<std::size_t>(c.default_size);
     }
+}
+
+// Fills `blocks` with what program `p`'s uniform blocks and storage blocks bind now, in that
+// order, and `key` with the set's key: the uniforms' buffer and offset, then each block's buffer,
+// offset and size, then each sampler's view, sampler and texel view.
+void descriptor_key(
+    const Program& p,
+    std::span<const Sampled> samplers,
+    std::vector<BufferRef>& blocks,
+    std::vector<std::uint64_t>& key
+) {
+    const CompiledProgram& c = p.compiled;
+    blocks.clear();
+    key.clear();
+
+    // Each uniform block at its GL binding point.
+    for (std::size_t i = 0; i < c.blocks.size(); ++i) {
+        blocks.push_back(block_buffer(p.block_bindings[i], c.blocks[i].size));
+    }
+
+    // Each storage block, or the dummy buffer when its binding names no buffer.
+    for (const auto& block : c.storage) {
+        auto* b = block.binding >= 0 && block.binding < kUniformBindings
+                      ? g->buffers.find(g->state.storage_bindings[block.binding])
+                      : nullptr;
+        blocks.push_back(b ? resolve(*b) : dummy_buffer_ref());
+    }
+
+    // A dynamic uniform buffer's offset is given at the bind, so it is not part of the set.
+    key.push_back(reinterpret_cast<std::uint64_t>(p.uniforms_buffer));
+    key.push_back(p.dynamic_uniforms ? 0 : p.uniforms_offset);
+
+    // The blocks' ranges.
+    for (const BufferRef& b : blocks) {
+        key.push_back(reinterpret_cast<std::uint64_t>(b.buffer));
+        key.push_back(b.offset);
+        key.push_back(b.size);
+    }
+
+    // The samplers' descriptors.
+    for (const Sampled& s : samplers) {
+        key.push_back(reinterpret_cast<std::uint64_t>(s.view));
+        key.push_back(reinterpret_cast<std::uint64_t>(s.sampler));
+        key.push_back(reinterpret_cast<std::uint64_t>(s.texels));
+    }
+}
+
+// Writes into the new `set` program `p`'s default uniforms, `blocks` and `samplers`, through
+// `scratch`'s writes and infos.
+void write_set(
+    const Program& p,
+    VkDescriptorSet set,
+    std::span<const BufferRef> blocks,
+    std::span<const Sampled> samplers,
+    DrawScratch& scratch
+) {
+    const CompiledProgram& c = p.compiled;
+    std::vector<VkWriteDescriptorSet>& writes = scratch.writes;
+    std::vector<VkDescriptorBufferInfo>& buffer_infos = scratch.buffer_infos;
+    std::vector<VkDescriptorImageInfo>& image_infos = scratch.image_infos;
+    writes.clear();
+    buffer_infos.clear();
+    image_infos.clear();
+
+    // The writes point into the infos, so these must not grow while they are filled.
+    buffer_infos.reserve(blocks.size() + 1);
+    image_infos.reserve(samplers.size());
+
+    // Adds one write of `type` at `binding` and returns it for its info pointer.
+    auto write = [&](int binding, VkDescriptorType type) -> VkWriteDescriptorSet& {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.dstBinding = static_cast<std::uint32_t>(binding);
+        w.descriptorCount = 1;
+        w.descriptorType = type;
+        writes.push_back(w);
+        return writes.back();
+    };
+
+    // The default uniforms, dynamic or at their ring offset.
+    if (c.default_binding >= 0) {
+        buffer_infos.push_back(
+            {p.uniforms_buffer,
+             p.dynamic_uniforms ? 0 : p.uniforms_offset,
+             static_cast<VkDeviceSize>(c.default_size)}
+        );
+        write(
+            c.default_binding,
+            p.dynamic_uniforms ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                               : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+        )
+            .pBufferInfo = &buffer_infos.back();
+    }
+
+    // The uniform blocks.
+    for (std::size_t i = 0; i < c.blocks.size(); ++i) {
+        buffer_infos.push_back({blocks[i].buffer, blocks[i].offset, blocks[i].size});
+        write(c.blocks[i].binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).pBufferInfo =
+            &buffer_infos.back();
+    }
+
+    // The storage blocks, after the uniform blocks in `blocks`.
+    for (std::size_t i = 0; i < c.storage.size(); ++i) {
+        const auto& b = blocks[c.blocks.size() + i];
+        buffer_infos.push_back({b.buffer, b.offset, b.size});
+        write(c.storage[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo =
+            &buffer_infos.back();
+    }
+
+    std::size_t at = 0;
+
+    // Each sampler uniform with a binding, in the order `samplers` holds them.
+    for (const ProgramUniform& u : c.uniforms) {
+        // Not a sampler, or one the compiler gave no binding.
+        if (!u.sampler || u.binding < 0) {
+            continue;
+        }
+
+        const Sampled& s = samplers[at++];
+
+        // A buffer texture is a texel view; the rest an image and its sampler.
+        if (u.kind == SamplerKind::Buffer) {
+            write(u.binding, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER).pTexelBufferView = &s.texels;
+        } else {
+            image_infos.push_back({s.sampler, s.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+            write(u.binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo =
+                &image_infos.back();
+        }
+    }
+
+    vkUpdateDescriptorSets(
+        g->device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr
+    );
+    g->submission.descriptor_writes += writes.size();
+}
+
+// The reference path of descriptors(), as it was before R-04: its key, blocks, writes and infos
+// are vectors of its own, and Program::descriptor_sets is keyed by a copy of the key.
+VkDescriptorSet descriptors_reference(Program& p, std::span<const Sampled> samplers) {
+    if (p.set_layout == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    const CompiledProgram& c = p.compiled;
+    begin_program_sets(p);
     std::vector<BufferRef> blocks;
     blocks.reserve(c.blocks.size());
     for (std::size_t i = 0; i < c.blocks.size(); ++i) {
@@ -727,6 +1061,71 @@ VkDescriptorSet descriptors(Program& p, const std::vector<Sampled>& samplers) {
     p.last_set = set;
     p.last_set_frame = g->frame_count;
     return set;
+}
+
+// descriptors() with vk-draw-cache: the reference path's sets, found and made with
+// Context::scratch's arrays and Program::set_cache, so a set found allocates nothing.
+VkDescriptorSet descriptors_cached(Program& p, std::span<const Sampled> samplers) {
+    begin_program_sets(p);
+    DrawScratch& scratch = g->scratch;
+    descriptor_key(p, samplers, scratch.blocks, scratch.key);
+    const std::span<const std::uint64_t> key = scratch.key;
+
+    // The draw before bound the same resources this frame: its set again.
+    if (p.last_set != VK_NULL_HANDLE && p.last_set_frame == g->frame_count
+        && std::ranges::equal(key, p.last_key)) {
+        ++g->submission.descriptor_reuses;
+        return p.last_set;
+    }
+
+    const std::uint64_t hash = hash_words(key);
+
+    // A set made earlier this frame for these resources.
+    if (reuse_uniforms()) {
+        // Found: it becomes the last set.
+        if (const VkDescriptorSet found = p.set_cache.find(key, hash); found != VK_NULL_HANDLE) {
+            p.last_key.assign(key.begin(), key.end());
+            p.last_set = found;
+            ++g->submission.descriptor_reuses;
+            return p.last_set;
+        }
+    }
+
+    const VkDescriptorSet set = allocate_set(p.set_layout);
+
+    // The pools are exhausted and a new one could not be made.
+    if (set == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    write_set(p, set, scratch.blocks, samplers, scratch);
+    ++g->submission.descriptor_sets;
+
+    // Kept for the rest of the frame, unless the reuse is the reference that is switched off.
+    if (reuse_uniforms()) {
+        p.set_cache.insert(key, hash, set);
+    }
+
+    p.last_key.assign(key.begin(), key.end());
+    p.last_set = set;
+    p.last_set_frame = g->frame_count;
+    return set;
+}
+
+}  // namespace
+
+VkDescriptorSet descriptors(Program& p, std::span<const Sampled> samplers) {
+    // A program with no resources has no set.
+    if (p.set_layout == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    // The allocation-free path, or the reference.
+    if (renderer::render_opt::enabled(renderer::render_opt::Opt::VkDrawCache)) {
+        return descriptors_cached(p, samplers);
+    }
+
+    return descriptors_reference(p, samplers);
 }
 
 void OPENRAC_GLAPI dispatch_compute(GLuint x, GLuint y, GLuint z) {

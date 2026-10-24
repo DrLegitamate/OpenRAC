@@ -336,13 +336,22 @@ void draw(
     if (s.viewport[2] <= 0 || s.viewport[3] <= 0) {
         return;
     }
-    // What it samples, in the layout for sampling: moved before the drawing begins.
-    std::vector<Sampled> samplers;
+    // What it samples, in the layout for sampling: moved before the drawing begins. The list is
+    // the Context's, kept for its capacity (vk-draw-cache), or a vector of the draw's own.
+    std::vector<Sampled> own_samplers;
+    std::vector<Sampled>& samplers =
+        renderer::render_opt::enabled(renderer::render_opt::Opt::VkDrawCache) ? g->scratch.samplers
+                                                                              : own_samplers;
+    samplers.clear();
+
+    // Each sampler uniform the compiler gave a binding.
     for (std::size_t i = 0; i < p->compiled.uniforms.size(); ++i) {
+        // A sampler with a binding: what its unit holds now.
         if (p->compiled.uniforms[i].sampler && p->compiled.uniforms[i].binding >= 0) {
             samplers.push_back(sampled(*p, i));
         }
     }
+
     for (Sampled& sm : samplers) {
         Image* image = sm.image;
         if (image != nullptr && (image == t.colour || image == t.depth)) {
@@ -427,6 +436,13 @@ void draw(
             return;
         }
         if (index_type == GL_UNSIGNED_BYTE) {
+            // No renderer draws 8-bit indices (REPORT C6): said once if one ever does, so the
+            // emulation below can go when nothing has said it.
+            if (!g->byte_indices_logged) {
+                log::warn("vulkan: a draw with 8-bit indices, which the backend makes 16-bit");
+                g->byte_indices_logged = true;
+            }
+
             // Vulkan's 8-bit indices are an extension: made 16-bit, from the CPU's copy.
             const std::vector<std::uint8_t>& bytes = buffer_bytes(*eb);
             const std::size_t from = std::min<std::size_t>(index_offset, bytes.size());
