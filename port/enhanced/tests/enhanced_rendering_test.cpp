@@ -8,7 +8,9 @@
 #include "enhanced/tests/probe_fixture.h"
 #include "enhanced/viewer/early_lighting.h"
 #include "enhanced/viewer/probe_lighting.h"
+#include "enhanced/viewer/scene_lighting.h"
 #include "scene/level_renderer.h"
+#include "scene_shaders.h"
 #include "tests/check.h"
 #include "tests/renderer_gl_context.h"
 
@@ -36,30 +38,32 @@ int main(int argc, char** argv) {
     if (!expected) {
         // Explicit API requests must not bypass the build/backend boundary.
         auto volume = lighting::ProbeVolume::allocate({});
-        scene::ProbeLighting probes;
+        lighting::ProbeLighting probes;
         CHECK(!probes.upload(openrac::test::gpu_probes(volume), error));
         CHECK(!probes.active());
         CHECK(!probes.compute_selection());
         scene::LevelScene scene;
+        lighting::use_scene_lighting(scene);
         CHECK(!scene.enable_sun_shadow(true, error));
         CHECK(!scene.enable_hero_shadow(true, error));
         CHECK(!scene.sun_shadow_enabled() && !scene.hero_shadow_enabled());
-        CHECK(!scene::EarlyLighting::supported());
+        CHECK(!lighting::EarlyLighting::supported());
         renderer::Gtao ao;
         CHECK(!ao.render({}, {}));
         CHECK(ao.visibility_texture() == 0 && ao.depth_texture() == 0);
         // No atlas/shadow source is injected into the compatibility shader.
-        const auto fragment = scene::probe_mesh_fragment();
+        const auto fragment = lighting::probe_mesh_fragment(scene::shaders::mesh_frag);
         CHECK(fragment.find("uniform sampler2D probe_irradiance") == std::string::npos);
         CHECK(fragment.find("uniform sampler2D sun_shadow_map0") == std::string::npos);
     }
     if (expected) {
-        scene::ProbeLighting probes;
+        lighting::ProbeLighting probes;
         CHECK(!probes.upload(lighting::ProbeVolume::allocate({}), error)
         );  // No runtime conversion fallback.
         renderer::Renderer renderer;
         renderer.set_ambient_occlusion(std::make_unique<renderer::Gtao>());
         scene::LevelScene scene;
+        lighting::use_scene_lighting(scene);
         scene::LevelData level;
         for (const auto& p :
              {renderer::Vec3{-1, -1, 0}, renderer::Vec3{1, -1, 0}, renderer::Vec3{0, 1, 0}}) {
@@ -81,12 +85,12 @@ int main(int argc, char** argv) {
         CHECK(!scene.probe_data_available());
         {
             // A level without a bake under the player's probe folder keeps the original lighting.
-            scene::set_probe_root(std::filesystem::temp_directory_path() / "openrac-no-probes");
+            lighting::set_probe_root(std::filesystem::temp_directory_path() / "openrac-no-probes");
             level.dir = "level_05";
-            scene::ProbeLighting unbaked;
+            lighting::ProbeLighting unbaked;
             unbaked.load(level);
             CHECK(!unbaked.has_data() && !unbaked.active());
-            scene::set_probe_root({});
+            lighting::set_probe_root({});
         }
         CHECK(!scene.enable_sun_shadow(true, error));
         CHECK(!scene.enable_hero_shadow(true, error));

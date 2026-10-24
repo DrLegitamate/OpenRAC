@@ -6,12 +6,13 @@
 #include "enhanced/renderer/gtao.h"
 #include "enhanced/tests/gpu_probe_fixture.h"
 #include "enhanced/viewer/probe_lighting.h"
+#include "enhanced/viewer/scene_lighting.h"
+#include "enhanced_viewer_shaders.h"
 #include "renderer/framebuffer.h"
 #include "renderer/gl.h"
 #include "scene/level_renderer.h"
 #include "tests/check.h"
 #include "tests/renderer_gl_context.h"
-#include "viewer_shaders.h"
 using namespace openrac;
 using namespace openrac::gl;
 
@@ -71,7 +72,7 @@ void check(
     bool camera_bias = false,
     bool bias_occluder = false
 ) {
-    scene::ProbeLighting probes;
+    lighting::ProbeLighting probes;
     std::string error;
     const auto packed_dense =
         dense ? std::optional{openrac::test::gpu_probes(*dense)} : std::nullopt;
@@ -181,7 +182,7 @@ void coverage_seam(
                     usable ? lighting::Float2{1024, 1048576} : lighting::Float2{0.01f, 0.0001f};
             }
         }
-        scene::ProbeLighting probes;
+        lighting::ProbeLighting probes;
         std::string error;
         const auto packed_dense = openrac::test::gpu_probes(dense);
         CHECK(probes.upload(openrac::test::gpu_probes(coarse), error, &packed_dense));
@@ -282,7 +283,7 @@ void material_path(
         }
         level.image_paths.push_back("emission-test");
         level.materials.back().emission_image = 0;
-        level.materials.back().emission_mask = lighting::EmissionMask::Green;
+        level.materials.back().emission_mask = scene::EmissionMask::Green;
     }
     scene::Model model;
     model.primitives.push_back({0, 3, 0});
@@ -309,6 +310,7 @@ void material_path(
     renderer::Renderer renderer;
     renderer.set_ambient_occlusion(std::make_unique<renderer::Gtao>());
     scene::LevelScene scene;
+    lighting::use_scene_lighting(scene);
     std::string error;
     CHECK(scene.upload(level, renderer.textures(), error));
     scene.set_probe_lighting(true, 1.2f);  // explicit intensity for this fixture
@@ -336,7 +338,9 @@ void material_path(
     for (auto& e : volume.irradiance) {
         e = {3.14159265f, 3.14159265f, 3.14159265f};
     }
-    CHECK(scene.set_probe_volume(openrac::test::gpu_probes(volume), error));
+    CHECK(
+        lighting::scene_lighting(scene)->set_probe_volume(openrac::test::gpu_probes(volume), error)
+    );
     if (indirect) {
         scene.set_probe_view(2);
     }
@@ -349,7 +353,10 @@ void material_path(
         for (auto& e : volume.irradiance) {
             e = {};
         }
-        CHECK(scene.set_probe_volume(openrac::test::gpu_probes(volume), error));
+        CHECK(
+            lighting::scene_lighting(scene)
+                ->set_probe_volume(openrac::test::gpu_probes(volume), error)
+        );
         for (float multiplier : {0.f, 5.f}) {
             scene.set_probe_lighting(true, multiplier);
             input.gtao = true;
@@ -365,7 +372,10 @@ void material_path(
         for (auto& e : volume.irradiance) {
             e = {};
         }
-        CHECK(scene.set_probe_volume(openrac::test::gpu_probes(volume), error));
+        CHECK(
+            lighting::scene_lighting(scene)
+                ->set_probe_volume(openrac::test::gpu_probes(volume), error)
+        );
         std::vector<std::uint8_t> isolated;
         for (float multiplier : {0.0f, 5.0f}) {
             scene.set_probe_lighting(true, multiplier);
@@ -386,8 +396,8 @@ void material_path(
                     mask_transition
                         ? Float3{linear(128.f / 255), linear(160.f / 255), linear(128.f / 255)}
                         : (masked ? Float3{0, 1, 0} : Float3{1, 1, 1});
-                float coverage = lighting::emission_mask(
-                    masked ? lighting::EmissionMask::Green : lighting::EmissionMask::None, colour
+                float coverage = scene::emission_mask(
+                    masked ? scene::EmissionMask::Green : scene::EmissionMask::None, colour
                 );
                 float e = .125f * colour[1] * coverage;
                 float display =
@@ -451,7 +461,10 @@ void material_path(
         for (auto& e : volume.irradiance) {
             e = {0, 0, 0};
         }
-        CHECK(scene.set_probe_volume(openrac::test::gpu_probes(volume), error));
+        CHECK(
+            lighting::scene_lighting(scene)
+                ->set_probe_volume(openrac::test::gpu_probes(volume), error)
+        );
         std::array<float, 64> points{};
         points[0] = points[1] = points[2] = 1;
         points[6] = 1;
@@ -465,7 +478,7 @@ void material_path(
         CHECK(frame.read_rgba() == direct);  // GI multiplier never changes direct light
     }
     CHECK(glGetError() == GL_NO_ERROR);
-    if (layer == scene::Layer::Terrain && !glow && scene::ProbeSelection::supported()) {
+    if (layer == scene::Layer::Terrain && !glow && lighting::ProbeSelection::supported()) {
         // Exercise the real prepass hook with AO disabled, then enabled. The
         // resolved depth must select green GI before the colour pass shades it.
         auto local_grid = volume.grid;
@@ -481,9 +494,11 @@ void material_path(
         for (auto& m : local.distance_moments) {
             m = {1024, 1024 * 1024};
         }
-        CHECK(scene.set_probe_regions(
-            openrac::test::gpu_probes(volume), {openrac::test::gpu_probes(local)}, error
-        ));
+        CHECK(
+            lighting::scene_lighting(scene)->set_probe_regions(
+                openrac::test::gpu_probes(volume), {openrac::test::gpu_probes(local)}, error
+            )
+        );
         CHECK(scene.compute_probe_selection());
         scene.update_probe_regions(input.camera, 1);
         input.after_world_depth = [&](unsigned depth, int width, int height) {
@@ -502,7 +517,7 @@ void material_path(
 }
 
 void compute_regions(renderer::Shader&, renderer::FrameBuffer&, unsigned vao) {
-    if (!scene::ProbeSelection::supported()) {
+    if (!lighting::ProbeSelection::supported()) {
         std::printf("Tiled probe fixture unavailable on this context\n");
         return;
     }
@@ -552,7 +567,7 @@ void compute_regions(renderer::Shader&, renderer::FrameBuffer&, unsigned vao) {
         );
         regions.push_back(std::move(region));
     }
-    scene::ProbeLighting probes;
+    lighting::ProbeLighting probes;
     std::string error;
     CHECK(probes.upload_regions(
         openrac::test::gpu_probes(base), openrac::test::gpu_regions(regions), error
@@ -563,7 +578,7 @@ void compute_regions(renderer::Shader&, renderer::FrameBuffer&, unsigned vao) {
         return;
     }
     std::string fragment = "#version 410 core\n";
-    fragment += scene::shaders::probes_glsl;
+    fragment += lighting::shaders::probes_glsl;
     fragment += R"glsl(uniform sampler2D receiver_depth;
 uniform mat4 test_clip;
 uniform vec2 test_extent;
@@ -766,7 +781,7 @@ void camera_regions(renderer::Shader& shader, renderer::FrameBuffer& frame, unsi
         if (variant == 3) {
             regions.resize(129, regions.back());  // Force two-slot streaming fallback.
         }
-        scene::ProbeLighting probes;
+        lighting::ProbeLighting probes;
         std::string error;
         CHECK(probes.upload_regions(
             openrac::test::gpu_probes(base), openrac::test::gpu_regions(regions), error
@@ -860,6 +875,7 @@ void camera_facing_normals() {
             renderer::Renderer renderer;
             renderer.set_ambient_occlusion(std::make_unique<renderer::Gtao>());
             scene::LevelScene scene;
+            lighting::use_scene_lighting(scene);
             std::string error;
             CHECK(scene.upload(level, renderer.textures(), error));
             CHECK(renderer.add(
@@ -891,7 +907,10 @@ void camera_facing_normals() {
                 }
             }
             lighting::update_probe_gutters(volume);
-            CHECK(scene.set_probe_volume(openrac::test::gpu_probes(volume), error));
+            CHECK(
+                lighting::scene_lighting(scene)
+                    ->set_probe_volume(openrac::test::gpu_probes(volume), error)
+            );
             for (bool below : {false, true}) {
                 renderer::FrameInput input;
                 input.camera.view = renderer::identity();
@@ -932,7 +951,7 @@ void dense_sphere_fade() {
     for (auto& p : dense.probes) {
         p.valid = true;
     }
-    scene::ProbeLighting probes;
+    lighting::ProbeLighting probes;
     std::string error;
     CHECK(probes.upload_regions(
         openrac::test::gpu_probes(base), {openrac::test::gpu_probes(dense)}, error
@@ -1015,7 +1034,7 @@ void sphere_overlay() {
     // The visible sphere must be drawn at this relocated centre (x=0),
     // rather than the nominal x=-0.5 position.
     volume.probes[0].offset = {0.5f, 0, 0};
-    scene::ProbeLighting probes;
+    lighting::ProbeLighting probes;
     std::string error;
     CHECK(probes.upload(openrac::test::gpu_probes(volume), error));
     probes.show_spheres = true;
@@ -1058,7 +1077,8 @@ void sphere_overlay() {
 void sunlight_rgb_correction() {
     renderer::Shader shader;
     std::string error;
-    const auto source = std::string("#version 410 core\n") + scene::shaders::probes_glsl + R"glsl(
+    const auto source =
+        std::string("#version 410 core\n") + lighting::shaders::probes_glsl + R"glsl(
 uniform float test_visibility;
 layout(location = 0) out vec4 result;
 void main() {
@@ -1202,7 +1222,7 @@ int main() {
     }
     compact_texture_uploads();
     std::string fragment = "#version 410 core\n";
-    fragment += scene::shaders::probes_glsl;
+    fragment += lighting::shaders::probes_glsl;
     fragment += R"glsl(uniform vec4 positions[8];
 uniform vec4 normals[8];
 uniform int camera_biased;
