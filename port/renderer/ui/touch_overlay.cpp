@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 the OpenRAC contributors
 
-#include "touch_overlay.h"
+#include "renderer/ui/touch_overlay.h"
 
 #include <algorithm>
 #include <string>
@@ -10,7 +10,7 @@
 #include "renderer/gl.h"
 #include "renderer/shader.h"
 
-namespace openrac::frontend::touch_overlay {
+namespace openrac::renderer::ui::touch_overlay {
 namespace {
 
 using namespace openrac::gl;
@@ -356,4 +356,4 @@ void release() {
     s = State{};
 }
 
-}  // namespace openrac::frontend::touch_overlay
+}  // namespace openrac::renderer::ui::touch_overlay

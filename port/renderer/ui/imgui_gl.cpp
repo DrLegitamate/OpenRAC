@@ -5,7 +5,7 @@
 // 2014-2025 Omar Cornut) does, with the calls renderer/gl.h has: one program, one vertex array,
 // the font's texture, a scissor per command.
 
-#include "imgui_gl.h"
+#include "renderer/ui/imgui_gl.h"
 
 #include <cstdint>
 
@@ -14,7 +14,7 @@
 #include "renderer/gl.h"
 #include "renderer/shader.h"
 
-namespace openrac::frontend::imgui_gl {
+namespace openrac::renderer::ui::imgui_gl {
 namespace {
 
 using namespace openrac::gl;
@@ -185,4 +185,4 @@ void shutdown() {
     s = nullptr;
 }
 
-}  // namespace openrac::frontend::imgui_gl
+}  // namespace openrac::renderer::ui::imgui_gl

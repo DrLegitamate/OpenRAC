@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 the OpenRAC contributors
 
-#include "fps_counter.h"
+#include "renderer/ui/fps_counter.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -12,7 +12,7 @@
 
 #include "renderer/gl.h"
 
-namespace openrac::frontend::fps_counter {
+namespace openrac::renderer::ui::fps_counter {
 
 namespace {
 
@@ -152,4 +152,4 @@ void release() {
     s = State{};
 }
 
-}  // namespace openrac::frontend::fps_counter
+}  // namespace openrac::renderer::ui::fps_counter

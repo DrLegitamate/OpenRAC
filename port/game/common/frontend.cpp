@@ -31,7 +31,6 @@
 #include "debug_overlay.h"
 #include "enhanced/game/scripted_moby_colour.h"
 #include "enhanced/viewer/hero_shadow.h"
-#include "fps_counter.h"
 #include "frame_pacing.h"
 #include "game/common/frontend/geometry.h"
 #include "game/common/frontend/pacing.h"
@@ -53,13 +52,14 @@
 #include "renderer/gl_stats.h"
 #include "renderer/renderer.h"
 #include "renderer/shadows.h"
+#include "renderer/ui/fps_counter.h"
+#include "renderer/ui/touch_overlay.h"
 #include "scene/level.h"
 #include "scene/level_renderer.h"
 #include "scene/moby_pose.h"
 #include "scene/moby_shadow.h"
 #include "scene/screenshot.h"
 #include "settings.h"
-#include "touch_overlay.h"
 
 extern "C" int openrac_game_loaded_overlay(void);
 
@@ -484,8 +484,8 @@ void close() {
     if (g) {
         debug_overlay::release();
         settings::save();  // the window's size, if it was changed
-        fps_counter::release();
-        touch_overlay::release();
+        renderer::ui::fps_counter::release();
+        renderer::ui::touch_overlay::release();
         debug_menu::release();
         g->frame.release();
         g->picture.release();
