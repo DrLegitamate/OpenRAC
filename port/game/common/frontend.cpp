@@ -53,13 +53,13 @@
 #include "renderer/gl_stats.h"
 #include "renderer/renderer.h"
 #include "renderer/shadows.h"
+#include "scene/level.h"
+#include "scene/level_renderer.h"
+#include "scene/moby_pose.h"
+#include "scene/moby_shadow.h"
+#include "scene/screenshot.h"
 #include "settings.h"
 #include "touch_overlay.h"
-#include "viewer/level.h"
-#include "viewer/level_renderer.h"
-#include "viewer/moby_pose.h"
-#include "viewer/moby_shadow.h"
-#include "viewer/screenshot.h"
 
 extern "C" int openrac_game_loaded_overlay(void);
 
@@ -446,7 +446,7 @@ bool show_picture(const std::uint8_t* rgba, int width, int height, float black) 
     const std::uint64_t index = g->index++;
     if (shots().due(index)) {
         const std::string path = shots().prefix + std::to_string(index) + ".png";
-        viewer::write_png(path, width, height, pixels);
+        scene::write_png(path, width, height, pixels);
         log::info("frame {} written to {}", index, path);
     }
     // The picture fills the frame the game's own frames fill; its first row is the top.
