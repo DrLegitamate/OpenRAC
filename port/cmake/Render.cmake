@@ -28,6 +28,13 @@ add_library(openrac_render_opt STATIC renderer/render_opt.cpp)
 target_link_libraries(openrac_render_opt PUBLIC openrac_common)
 openrac_warnings(openrac_render_opt)
 
+# The envelope of the Vulkan backend's cache files (renderer/vulkan/cache_file.h), which the
+# pipeline cache and its manifest share (R-10). Added here so that cmake/Window.cmake, which makes
+# the target, is left to its own lane.
+if(TARGET openrac_renderer_vulkan)
+  target_sources(openrac_renderer_vulkan PRIVATE renderer/vulkan/cache_file.cpp)
+endif()
+
 # The renderers whose draw code asks the registry.
 foreach(renderer openrac_renderer openrac_renderer_vulkan)
   if(TARGET ${renderer})
@@ -104,5 +111,12 @@ if(TARGET openrac_renderer_vulkan)
   openrac_add_test(vulkan_present
     LIBS openrac_renderer openrac_platform openrac_renderer_vulkan)
   set_tests_properties(vulkan_present PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
+    "OPENRAC_GL_API=vulkan;OPENRAC_VULKAN_VALIDATION=1")
+  # vulkan_prewarm  a run's pipelines made again on the pre-warm worker in the next run, a damaged
+  #                 manifest and one of a program no longer built ignored
+  #                 (tests/vulkan_prewarm_test.cpp); its pipeline cache and manifest are its own
+  openrac_add_test(vulkan_prewarm
+    LIBS openrac_renderer openrac_platform openrac_renderer_vulkan)
+  set_tests_properties(vulkan_prewarm PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
     "OPENRAC_GL_API=vulkan;OPENRAC_VULKAN_VALIDATION=1")
 endif()
