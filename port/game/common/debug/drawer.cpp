@@ -593,6 +593,11 @@ void drawer(const Shown& shown) {
             settings::get().fresh_input = !settings::get().fresh_input;
             settings::save();
         }
+        // The controls window (debug/controls_window.cpp), over the game once the drawer is shut.
+        if (drawer_row("Controller bindings")) {
+            s.controls_window = true;
+            set_drawer(false);
+        }
         card_end();
 
         // The on-screen pad (platform/touch_pad.h): its size, the camera's speed, and where its
