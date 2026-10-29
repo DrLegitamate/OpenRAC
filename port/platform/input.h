@@ -22,10 +22,12 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "platform/bindings.h"
 #include "platform/pad.h"
+#include "platform/players.h"
 #include "platform/touch_pad.h"
 
 union SDL_Event;
@@ -49,9 +51,18 @@ struct KeyboardMouse {
     bool captured = false;
 };
 
+// A controller connected now, as the controls window and the launcher name it.
+struct Device {
+    std::string id;    // stable from one run to the next (players.h)
+    std::string name;  // SDL's name for it ("DualSense Wireless Controller")
+    int player = -1;   // the player it is, 0 or 1; -1 none
+};
+
 // Apply the port's default keyboard table to a pad: `keys` is indexed by SDL scancode, as
 // SDL_GetKeyboardState returns it. A stick key overrides the stick's axis.
 void apply_keyboard(Pad& pad, std::span<const bool> keys);
+
+static_assert(kPlayers == kPadPorts);
 
 class Input {
 public:
@@ -86,7 +97,22 @@ public:
 
     const Bindings& bindings() const { return m_bindings; }
 
-    // False: the keyboard table no longer presses pad 0's buttons (a mod took the keyboard).
+    // Which controller each player reads (players.h): applied at once, and again whenever a
+    // controller connects or leaves.
+    void set_players(const Players& players);
+
+    const Players& players() const { return m_players; }
+
+    // The controllers connected, in the order they were, with the player each is.
+    const std::vector<Device>& devices() const { return m_devices; }
+
+    // Says whether a controller connected or left, or the players changed, since the last call.
+    bool take_devices_changed();
+
+    // The player the keyboard is, -1 none.
+    int keyboard_player() const { return m_assignment.keyboard; }
+
+    // False: the keyboard table no longer presses its player's buttons (a mod took the keyboard).
     void set_keyboard_table(bool on) { m_keyboard_table = on; }
 
     // Whether the cursor is captured now (the frontend sets it: SDL's relative mouse mode).
@@ -99,8 +125,15 @@ public:
 private:
     SDL_Gamepad* gamepad(int port) const;
 
+    // Works out again which controller each player reads, and the devices' players.
+    void assign_players();
+
     std::array<Pad, kPadPorts> m_pads{};
-    std::vector<SDL_Gamepad*> m_gamepads;
+    std::vector<SDL_Gamepad*> m_gamepads;  // in the order they connected, as m_devices
+    std::vector<Device> m_devices;
+    Players m_players = default_players();
+    Assignment m_assignment = assign(default_players(), {});
+    bool m_devices_changed = true;
     // Each port's sticks, left and right, as their gamepad has shown them (pad.h), and the gamepad
     // that showed it: another one on the port starts afresh.
     std::array<std::array<StickGate, 2>, kPadPorts> m_gates{};
