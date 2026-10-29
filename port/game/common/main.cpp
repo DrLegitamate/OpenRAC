@@ -66,6 +66,7 @@
 #include "enhanced/viewer/probe_lighting.h"
 #include "frontend.h"
 #include "mod_menu.h"
+#include "platform/bindings.h"
 #include "platform/input.h"
 #include "platform/pump.h"
 #include "platform/window.h"
@@ -520,6 +521,8 @@ int main(int argc, char** argv) {
             log::fatalf("no window: {}", why);
         }
         g_window = true;
+        // The player's controls (controls_store.h): the global file, then the game's own over it.
+        frontend::open_controls(g_options.controls, openrac_game.game);
         if (mods_loaded) {
             apply_early_mod_input();
         }

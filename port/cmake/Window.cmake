@@ -49,16 +49,22 @@ endfunction()
 # ---- platform ----
 add_library(openrac_platform STATIC
   platform/audio.cpp
+  platform/bindings.cpp
   platform/clock.cpp
+  platform/controls_file.cpp
   platform/gpu_driver.cpp
   platform/input.cpp
   platform/pad.cpp
+  platform/players.cpp
   platform/performance_hint.cpp
   platform/pump.cpp
   platform/touch_pad.cpp
   platform/window.cpp
 )
 target_link_libraries(openrac_platform PUBLIC openrac_common openrac_sdl3)
+# bindings.cpp reads the SDK's key names (sdk/include/openrac/keys.h), which the launcher, a mod's
+# keybind setting and the settings file all share.
+target_include_directories(openrac_platform PRIVATE "${PROJECT_SOURCE_DIR}/../sdk/include")
 openrac_warnings(openrac_platform)
 # Android: the player's own GPU driver package (platform/gpu_driver.h, cmake/Android.cmake).
 if(ANDROID)
