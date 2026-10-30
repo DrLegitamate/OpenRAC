@@ -41,9 +41,11 @@ constexpr const char* kLabels[kRows] = {
     "VSync",
     "Frame rate",
     "Frame cap",
+    "Low-latency frames",
     "Frame counter",
     "Mute in background",
     "Skip cutscenes",
+    "Responsive camera",
 
 };
 
@@ -86,6 +88,11 @@ constexpr Words kWords[] = {
       "Bildratenlimit",
       "Límite de fotogramas",
       "Limite fotogrammi"}},
+    {{"Low-latency frames",
+      "Images à faible latence",
+      "Bilder mit niedriger Latenz",
+      "Fotogramas de baja latencia",
+      "Fotogrammi a bassa latenza"}},
     {{"Frame counter",
       "Compteur d'images",
       "Bildzähler",
@@ -101,6 +108,11 @@ constexpr Words kWords[] = {
       "Videos überspringen",
       "Saltar cinemáticas",
       "Salta filmati"}},
+    {{"Responsive camera",
+      "Caméra réactive",
+      "Reaktive Kamera",
+      "Cámara reactiva",
+      "Telecamera reattiva"}},
     {{"Game fixes",
       "Corrections du jeu",
       "Spielkorrekturen",
@@ -126,6 +138,11 @@ constexpr Words kWords[] = {
       "Breitbild-Verkehr",
       "Tráfico panorámico",
       "Traffico widescreen"}},
+    {{"Wide-screen fires",
+      "Feux écran large",
+      "Breitbild-Feuer",
+      "Fuegos panorámicos",
+      "Fuochi widescreen"}},
     {{"On", "Activé", "An", "Sí", "Sì"}},
     {{"Off", "Désactivé", "Aus", "No", "No"}},
     {{"Original", "Original", "Original", "Original", "Originale"}},
@@ -319,12 +336,16 @@ std::string value_of(int row) {
             return settings::frame_rate_name(s);
         case kFrameCap:
             return s.frame_rate == settings::FrameRate::Capped ? std::to_string(s.frame_cap) : std::string("Off");
+        case kLowLatency:
+            return s.low_latency_frames ? "On" : "Off";
         case kShowFps:
             return settings::name(s.show_fps);
         case kMuteUnfocused:
             return s.mute_unfocused ? "On" : "Off";
         case kSkipCutscenes:
             return s.skip_cutscenes ? "Start" : "Off";
+        case kCameraLatch:
+            return s.camera_latch ? "On" : "Off";
         default:
             return {};
     }
@@ -436,6 +457,9 @@ void step_value(int row, int by) {
                 s.frame_cap = std::clamp(s.frame_cap + by * 5, settings::kFrameCapMin, settings::kFrameCapMax);
             }
             break;
+        case kLowLatency:
+            s.low_latency_frames = !s.low_latency_frames;
+            break;
         case kShowFps:
             settings::step_frame_counter(by);
             break;
@@ -444,6 +468,9 @@ void step_value(int row, int by) {
             break;
         case kSkipCutscenes:
             s.skip_cutscenes = !s.skip_cutscenes;
+            break;
+        case kCameraLatch:
+            s.camera_latch = !s.camera_latch;
             break;
         default:
             break;

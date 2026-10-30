@@ -151,10 +151,14 @@ struct Settings {
     // Lower input latency (both change only when input is read and frames are shown, never the
     // game's ticks; off, the timing players know). fresh_input: the pad read again just before each
     // tick. low_latency_frames: frames between ticks not held half a tick back, and fewer finished
-    // frames queued for the display.
+    // frames queued for the display; on Vulkan a frame between ticks begins (reads the time and the
+    // input) as late as lets it be queued just as the GPU is free, so that the frame rate stays.
     bool fresh_input = false;
     bool low_latency_frames = false;
     bool skip_cutscenes = true;   // Start skips an in-game cutscene (without the game's L1 L2 R1 R2 hold)
+    // The late camera latch (frontend/camera_latch.h): the frames between ticks turn the camera by
+    // the right stick as it is when each is drawn. Only the picture; the game's camera is its own.
+    bool camera_latch = true;
     int volume = 100;  // of everything the port plays, 0 (nothing at all) to 100 (as mixed)
     // The on-screen pad (platform/touch_pad.h): its controls' size and the camera's speed, in
     // percent of the pad's own, and where the player moved its groups (TouchPad::layout()).
