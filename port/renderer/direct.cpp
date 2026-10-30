@@ -1733,7 +1733,11 @@ void DirectRenderer::draw(const DirectDraw& d, RenderState& render_state) {
     const DirectState& s = d.state;
     if (d.mobys != 0) {
         // Mobys the game drew into this target: the frontend draws them, with the target bound;
-        // then this renderer's own state again.
+        // then this renderer's own state again. Our samplers are unbound first: they clamp, and the
+        // Pyrocitor needs its texture repeated (it was grey in the vendor's menu).
+        glBindSampler(0, 0);
+        glBindSampler(1, 0);
+        m_bound_sampler = 0xFFFFFFFF;
         if (m_frame != nullptr && m_frame->target_mobys && s.target != 0) {
             const Offscreen& o = offscreen(s.target);
             glBindFramebuffer(GL_FRAMEBUFFER, o.framebuffer);
