@@ -3,8 +3,11 @@
 //
 // The keyboard and SDL's gamepads, turned into the two DualShock 2 ports the
 // game reads (pad.h). Port 0 is the keyboard together with the first gamepad;
-// port 1 is the second gamepad. Gamepad buttons are mapped by position, so the
-// bottom face button is Cross on any controller.
+// port 1 is the second gamepad. A gamepad counts from its first press, ahead of
+// those not pressed yet (a dock's or a keyboard's device that SDL also lists as
+// one), and a gamepad pressed while port 0's has been left alone for two seconds
+// takes port 0 (the player picked up another controller). Gamepad buttons are mapped by position, so the bottom face button is
+// Cross on any controller.
 //
 // Default keyboard (by key position, whatever the layout):
 //
@@ -91,9 +94,23 @@ public:
 
 private:
     SDL_Gamepad* gamepad(int port) const;
+    struct Connected {
+        SDL_Gamepad* gamepad = nullptr;
+        std::uint64_t active_ns = 0;  // SDL's time of its last press or stick pushed well out
+    };
+    // How long port 0's gamepad is left alone before another one pressed takes the port.
+    static constexpr std::uint64_t kHandOverNs = 2'000'000'000;
+
+    std::vector<Connected>::iterator find(std::uint32_t which);  // SDL_JoystickID
+    // A gamepad's button pressed at SDL's time `ns`: the gamepad may move up the ports.
+    void pressed(std::uint32_t which, std::uint64_t ns);
 
     std::array<Pad, kPadPorts> m_pads{};
-    std::vector<SDL_Gamepad*> m_gamepads;
+    // The gamepads in port order: first those used so far (the first m_used), then the others in
+    // the order they came. A gamepad pressed takes port 0 when port 0's has been left alone for
+    // kHandOverNs (or was never used).
+    std::vector<Connected> m_gamepads;
+    std::size_t m_used = 0;
     // Each port's sticks, left and right, as their gamepad has shown them (pad.h), and the gamepad
     // that showed it: another one on the port starts afresh.
     std::array<std::array<StickGate, 2>, kPadPorts> m_gates{};
