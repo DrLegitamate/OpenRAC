@@ -660,7 +660,16 @@ int world_to_draw(std::span<const std::uint8_t> ram, int level) {
 
 // Uses the requested world after graphics ownership returns.
 void use_world(std::span<const std::uint8_t> ram, int level) {
-    use_level(world_to_draw(ram, level));
+    const int world = world_to_draw(ram, level);
+    use_level(world);
+    // The flight between planets plays while the game reads the next level from the disc; its
+    // number is already the level word's. Its files are read meanwhile, not after the flight.
+    if (world == -2 && openrac_game_front_end != nullptr && openrac_game_front_end->level != 0) {
+        const std::uint32_t next = word_at(ram, openrac_game_front_end->level);
+        if (next < static_cast<std::uint32_t>(openrac_game_front_end->levels)) {
+            preload_level(static_cast<int>(next));
+        }
+    }
 }
 
 // Puts the camera the game's world renderers drew with this tick into `state`, if they ran.
@@ -1624,7 +1633,12 @@ TickPackets capture_2d_path(
     if (before_world == SIZE_MAX && (draws & 0x10u) != 0) {
         before_world = first_offscreen;
     }
-    k.before_world = openrac_game_has_level(level) ? std::min(before_world, k.packets.size()) : 0;
+    // The flight between planets is drawn as the boot program draws it, also when it starts from a
+    // planet whose level program is still loaded (world_to_draw: the flight's world): split there,
+    // the planet's name was taken as coming before the world and the stars hid it.
+    k.before_world = openrac_game_has_level(level) && world_to_draw(ram, level) >= 0
+                         ? std::min(before_world, k.packets.size())
+                         : 0;
     k.named_quads = named_quads;
     return k;
 }
@@ -2050,6 +2064,10 @@ bool keep_picture() {
     if (run_over()) {
         return false;
     }
+    // The console shows its frame buffer as it is: the picture stands and nothing is drawn again.
+    // Drawn again, the kept tick's 2D read the textures a load had written over since (the flight's
+    // planet name came out as a solid block and its planet striped, before the landing).
+    g->repeat_frame = true;
     draw_kept(false);
     return !g->render_failed;
 }
