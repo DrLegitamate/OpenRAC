@@ -58,8 +58,7 @@ typedef struct {
     gaddr
         out; /* CollOutput: +0 the level's collision tree, +0x10 query stamp, +0x14 hit log index */
     gaddr mobys; /* the word holding the moby array's address */
-    gaddr
-        grid; /* the moby grid: 64 x 64 cells {u16 block, s8 count, u8 capacity}, lists at +0x4000 */
+    gaddr grid;  /* retail: 64x64 {u16 block, s8 count, u8 capacity}, lists at +0x4000 */
     gaddr hits; /* the moby hit log, 64 records of 0x40 */
     gaddr list; /* coll_sphere_mobys's list of mobys */
     gaddr hero; /* the word holding the hero-collision section's address */
@@ -239,7 +238,35 @@ static uint32_t cell_word(gaddr mesh, int x, int y, int z) {
     if (i < 0 || (int)U16(mesh + 2) - i <= 0) {
         return 0;
     }
-    gaddr slab = (gaddr)U16(mesh + 4 + 2 * i) * 4;
+    const uint16_t root_entry = U16(mesh + 4 + 2 * i);
+    gaddr slab;
+    if (root_entry != 0 && openrac_guest_ram_size > GUEST_RAM_SIZE && mesh >= 0x40
+        && U32(mesh - 0x40 + 16) == 0x54434C52u) {
+        const gaddr block = mesh - 0x40;
+        const uint32_t table_at = U32(block + 20);
+        const gaddr block_ram = openrac_guest_ram_address(block);
+        if (block_ram > openrac_guest_ram_size || table_at > openrac_guest_ram_size - block_ram
+            || openrac_guest_ram_size - block_ram - table_at < 4) {
+            return 0;
+        }
+        const gaddr table = block + table_at;
+        const uint32_t count = U32(table);
+        if (count != U16(mesh + 2) || root_entry > count
+            || 4u + 4u * (uint64_t)count > openrac_guest_ram_size - (block_ram + table_at)) {
+            return 0;
+        }
+        slab = U32(table + 4u * root_entry);
+        const uint32_t hero_at = U32(block + 4);
+        const gaddr mesh_ram = openrac_guest_ram_address(mesh);
+        if (slab == 0 || mesh_ram > openrac_guest_ram_size
+            || slab > openrac_guest_ram_size - mesh_ram
+            || openrac_guest_ram_size - mesh_ram - slab < 4
+            || (hero_at != 0 && (hero_at < 0x40u || slab >= hero_at - 0x40u))) {
+            return 0;
+        }
+    } else {
+        slab = (gaddr)root_entry * 4;
+    }
     if (slab == 0) {
         return 0;
     }
@@ -260,12 +287,20 @@ static uint32_t cell_word(gaddr mesh, int x, int y, int z) {
     return U32(row + 4 + 4 * i);
 }
 
+static int collision_has_extended_tree(gaddr mesh) {
+    return openrac_guest_ram_size > GUEST_RAM_SIZE && mesh >= 0x40
+           && (U32(mesh - 0x40 + 8) == 0x49434C52u || U32(mesh - 0x40 + 16) == 0x54434C52u);
+}
+
 typedef struct {
     gaddr leaf;
+    gaddr vertices;
+    gaddr faces;
     int nv;    /* vertices (byte +2) */
-    int nf;    /* faces walked: the low byte of the count (lbu) */
+    int nf;    /* faces (halfword +0) */
     int nq;    /* quads (byte +3) */
     gaddr qv3; /* the quads' fourth indices */
+    int extended;
 } Cell;
 
 /* A cell to test: the leaf of a non-zero word with vertices. */
@@ -273,14 +308,88 @@ static int cell_open(gaddr mesh, uint32_t word, Cell* c) {
     if (word == 0) {
         return 0;
     }
+    c->extended = 0;
+    if (openrac_guest_ram_size > GUEST_RAM_SIZE && mesh >= 0x40) {
+        uint32_t leaf_offset = word >> 8;
+        const gaddr block = mesh - 0x40;
+        const int indexed = U32(block + 8) == 0x49434C52u;
+        if (indexed) {
+            const uint32_t table_at = U32(block + 12);
+            const gaddr block_ram = openrac_guest_ram_address(block);
+            if (block_ram > openrac_guest_ram_size || table_at > openrac_guest_ram_size - block_ram
+                || openrac_guest_ram_size - block_ram - table_at < 4) {
+                return 0;
+            }
+            const gaddr table = block + table_at;
+            const uint32_t count = U32(table);
+            const uint32_t index = word >> 8;
+            const uint64_t table_bytes = 4u + 4u * (uint64_t)count;
+            if (count > 0xffffffu || index == 0 || index > count
+                || table_bytes > openrac_guest_ram_size - (block_ram + table_at)) {
+                return 0;
+            }
+            leaf_offset = U32(table + 4u * index);
+        }
+        if ((word & 0xff) != 0) {
+            c->leaf = mesh + (indexed ? leaf_offset : word >> 8);
+            c->nv = U8(c->leaf + 2);
+            c->nf = U16(c->leaf);
+            c->nq = U8(c->leaf + 3);
+            c->vertices = c->leaf + 4;
+            c->faces = c->vertices + 4 * (gaddr)c->nv;
+            c->qv3 = c->faces + 4 * (gaddr)c->nf;
+            return c->nv != 0;
+        }
+        const uint32_t hero_at = U32(block + 4);
+        if (hero_at != 0 && (hero_at < 0x40u || leaf_offset >= hero_at - 0x40u)) {
+            return 0;
+        }
+        const gaddr mesh_ram = openrac_guest_ram_address(mesh);
+        if (mesh_ram > openrac_guest_ram_size || leaf_offset > openrac_guest_ram_size - mesh_ram
+            || openrac_guest_ram_size - mesh_ram - leaf_offset < 16) {
+            return 0;
+        }
+        c->leaf = mesh + leaf_offset;
+        if (U32(c->leaf) != 0x58434C52u) {
+            return 0;
+        }
+        const uint32_t bytes = U32(c->leaf + 4);
+        const uint32_t nv = U32(c->leaf + 8);
+        const uint32_t nf = U32(c->leaf + 12);
+        const uint64_t needed = 16u + 4u * (uint64_t)nv + 16u * (uint64_t)nf;
+        const gaddr leaf_ram = openrac_guest_ram_address(c->leaf);
+        if (bytes < 16 || (bytes & 15) != 0 || needed > bytes || nv > INT32_MAX || nf > INT32_MAX
+            || leaf_ram > openrac_guest_ram_size || bytes > openrac_guest_ram_size - leaf_ram) {
+            return 0;
+        }
+        if (hero_at != 0 && bytes > hero_at - 0x40u - leaf_offset) {
+            return 0;
+        }
+        c->nv = (int)nv;
+        c->nf = (int)nf;
+        c->nq = 0;
+        c->vertices = c->leaf + 16;
+        c->faces = c->vertices + 4u * nv;
+        c->qv3 = 0;
+        c->extended = 1;
+        return c->nv != 0;
+    }
+    if ((word & 0xff) == 0) {
+        return 0;
+    }
     c->leaf = mesh + (word >> 8);
     c->nv = U8(c->leaf + 2);
     if (c->nv == 0) {
         return 0;
     }
-    c->nf = U8(c->leaf);
+    /* The leaf stores a halfword face count. Retail's vector loop walks its low byte (lbu), and
+     * its quads' fourth indices follow every face (the halfword): kept so in the console's arena.
+     * An expanded (modded) arena walks the whole halfword, so an edited cell may exceed 255 faces. */
+    c->nf = openrac_guest_ram_size > GUEST_RAM_SIZE ? U16(c->leaf) : U8(c->leaf);
     c->nq = U8(c->leaf + 3);
-    c->qv3 = c->leaf + 4 + 4 * (gaddr)c->nv + 4 * (gaddr)U16(c->leaf);
+    c->vertices = c->leaf + 4;
+    c->faces = c->vertices + 4 * (gaddr)c->nv;
+    c->qv3 = c->faces + 4 * (gaddr)U16(c->leaf);
     return 1;
 }
 
@@ -289,7 +398,42 @@ typedef struct {
     uint32_t code; /* per axis: bit 0 below the query box, bit 1 above */
 } Vert;
 
-static Vert g_verts[2048];
+static Vert g_verts_small[2048];
+static Vert* g_verts = g_verts_small;
+static Vert* g_verts_allocated;
+static size_t g_verts_capacity = 2048;
+
+static int ensure_verts(size_t count, int allow_growth) {
+    if (count <= g_verts_capacity) {
+        return 1;
+    }
+    /* Grow scratch only for expanded sessions; the format and query loops use signed int indices. */
+    if ((!allow_growth && openrac_guest_ram_size <= GUEST_RAM_SIZE) || count > INT32_MAX
+        || count > SIZE_MAX / sizeof(*g_verts)) {
+        return 0;
+    }
+    size_t capacity = g_verts_capacity * 2;
+    if (capacity < count) {
+        capacity = count;
+    }
+    if (capacity > INT32_MAX) {
+        capacity = count;
+    }
+    if (capacity > SIZE_MAX / sizeof(*g_verts)) {
+        capacity = count;
+    }
+    if (capacity > SIZE_MAX / sizeof(*g_verts)) {
+        return 0;
+    }
+    Vert* grown = realloc(g_verts_allocated, capacity * sizeof(*grown));
+    if (grown == NULL) {
+        return 0;
+    }
+    g_verts_allocated = grown;
+    g_verts = grown;
+    g_verts_capacity = capacity;
+    return 1;
+}
 
 /* ---- What the kernels leave in vector registers they do not compute ----
  *
@@ -326,10 +470,13 @@ static void vstw(gaddr a, V3 v, uint32_t w) {
 /* The cell's vertices as halfwords (x << 6, y << 6, z << 4) and their outcodes against [lo, hi]
  * with 16-bit wrapping compares (psubh). The decode loads two vertices at a time into vf1 / vf2, w
  * zero. */
-static void decode_vertices(const Cell* c, const int16_t lo[3], const int16_t hi[3]) {
+static int decode_vertices(const Cell* c, const int16_t lo[3], const int16_t hi[3]) {
+    if (!ensure_verts((size_t)c->nv, openrac_guest_ram_size > GUEST_RAM_SIZE)) {
+        return 0;
+    }
     g_vf2w = 0;
     for (int i = 0; i < c->nv; ++i) {
-        const uint32_t w = U32(c->leaf + 4 + 4 * (gaddr)i);
+        const uint32_t w = U32(c->vertices + 4 * (gaddr)i);
         const int32_t f[3] =
             {((int32_t)(w << 22)) >> 22, ((int32_t)(w << 12)) >> 22, ((int32_t)w) >> 20};
         const int16_t h[3] = {(int16_t)(f[0] << 6), (int16_t)(f[1] << 6), (int16_t)(f[2] << 4)};
@@ -342,17 +489,30 @@ static void decode_vertices(const Cell* c, const int16_t lo[3], const int16_t hi
         g_verts[i].p = v3((float)h[0], (float)h[1], (float)h[2]);
         g_verts[i].code = code;
     }
+    return 1;
 }
 
 /* Triangle j of the cell walk: the faces as (v0, v1, v2), then the first nq again as (v0, v2, v3). */
 static int cell_triangle(const Cell* c, int j, int v[3], int* type) {
-    const gaddr faces = c->leaf + 4 + 4 * (gaddr)c->nv;
+    const gaddr faces = c->faces;
     if (j < c->nf) {
-        const gaddr f = faces + 4 * (gaddr)j;
-        v[0] = U8(f);
-        v[1] = U8(f + 1);
-        v[2] = U8(f + 2);
-        *type = U8(f + 3);
+        if (c->extended) {
+            const gaddr f = faces + 16 * (gaddr)j;
+            v[0] = (int)U32(f);
+            v[1] = (int)U32(f + 4);
+            v[2] = (int)U32(f + 8);
+            *type = U8(f + 12);
+            if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[0] >= c->nv || v[1] >= c->nv
+                || v[2] >= c->nv) {
+                return 0;
+            }
+        } else {
+            const gaddr f = faces + 4 * (gaddr)j;
+            v[0] = U8(f);
+            v[1] = U8(f + 1);
+            v[2] = U8(f + 2);
+            *type = U8(f + 3);
+        }
         return 1;
     }
     j -= c->nf;
@@ -467,6 +627,9 @@ static inline gaddr moby_at(const Ctx* x, unsigned idx) {
 
 /* Cell (gx, gy) of the moby grid: its moby indices and how many. */
 static gaddr grid_cell(const Ctx* x, unsigned gx, unsigned gy, int* count) {
+    if (openrac_guest_ram_size > GUEST_RAM_SIZE) {
+        return rac1_expanded_grid_cell(gx, gy, count);
+    }
     const gaddr cell = x->grid + gx * 4 + gy * 0x100;
     *count = S8(cell + 2);
     return x->grid + 0x4000 + (gaddr)U16(cell) * 32;
@@ -476,6 +639,8 @@ typedef struct {
     gaddr m, blob;
     int joints; /* the joint count the query takes (+0 with flag 0x4, else +2) */
     int32_t vb; /* the mesh's vertex bytes (+0xC) */
+    uint32_t primitive_bytes; /* low 31 bits are the size; high bit selects OpenRAC's u16 indices */
+    int extended_indices;
     V3 pos;     /* +0x10 x1024 */
     V3 rows[3]; /* +0xC0, +0xD0, +0xE0 */
     float s;    /* +0x2C */
@@ -491,6 +656,9 @@ static int moby_head(gaddr m, uint32_t fl, MobyColl* c) {
     c->m = m;
     c->blob = U32(m + 0x94);
     c->joints = U16(c->blob + ((fl & 0x4) ? 0 : 2));
+    c->primitive_bytes = U32(c->blob + 4);
+    c->extended_indices = (c->primitive_bytes & 0x80000000u) != 0;
+    c->primitive_bytes &= 0x7fffffffu;
     c->vb = S32(c->blob + 0xC);
     return c->joints == 0 || c->vb != ((fl & 0x2) == 0 ? 1 : 0);
 }
@@ -508,11 +676,10 @@ static void moby_pose(MobyColl* c) {
 /* With a mesh (vb != 0): where its vertices and faces are (the primitives' bytes, +4, before them;
  * the face bytes, +8, after them). */
 static void moby_mesh(MobyColl* c) {
-    const int32_t pb = S32(c->blob + 4);
     c->nverts = c->vb / 8;
-    c->verts = c->blob + 0x10 + (gaddr)pb;
+    c->verts = c->blob + 0x10 + (gaddr)c->primitive_bytes;
     c->faces = c->verts + (gaddr)c->vb;
-    c->nfaces = S32(c->blob + 8) / 4;
+    c->nfaces = S32(c->blob + 8) / (c->extended_indices ? 8 : 4);
 }
 
 /* All of it in the order coll_sphere_mobys reads it. */
@@ -543,7 +710,12 @@ static int moby_mesh_verts(const MobyColl* c, V3 lo, V3 hi) {
     for (int r = 0; r < 3; ++r) {
         rs[r] = vmuls(c->rows[r], c->s);
     }
-    const int n = c->nverts < 2048 ? c->nverts : 2048;
+    /* The console's arena reads at most 2048 vertices (the retail buffer); an expanded one all. */
+    const int expanded = c->extended_indices || openrac_guest_ram_size > GUEST_RAM_SIZE;
+    const int n = expanded || c->nverts < 2048 ? c->nverts : 2048;
+    if (n < 0 || !ensure_verts((size_t)n, expanded)) {
+        return 0;
+    }
     for (int i = 0; i < n; ++i) {
         const gaddr v = c->verts + 8 * (gaddr)i;
         const V3 p = rot(rs, v3((float)S16(v), (float)S16(v + 2), (float)S16(v + 4)));
@@ -556,7 +728,7 @@ static int moby_mesh_verts(const MobyColl* c, V3 lo, V3 hi) {
         g_verts[i].p = p;
         g_verts[i].code = code;
     }
-    if (c->nverts > 0) {
+    if (c->nverts > 0 && n > 0) {
         g_vf2w = (uint32_t)(int32_t)S16(c->verts + 16 * (gaddr)((c->nverts + 1) / 2) + 14);
         g_r7 = g_verts[2 * ((n + 1) / 2 - 1)].code & 2;
     }
@@ -566,9 +738,11 @@ static int moby_mesh_verts(const MobyColl* c, V3 lo, V3 hi) {
 /* Face i of the blob, unless culled by its outcodes or the flags (face_excluded, step by step: one
  * past the outcodes has its vertices loaded). */
 static int moby_face(const MobyColl* c, int n, int i, uint32_t fl, Vert* v, int* ty) {
-    const gaddr f = c->faces + 4 * (gaddr)i;
-    const int a = U8(f), b = U8(f + 1), d = U8(f + 2);
-    *ty = U8(f + 3);
+    const gaddr f = c->faces + (c->extended_indices ? 8u : 4u) * (gaddr)i;
+    const int a = c->extended_indices ? U16(f) : U8(f);
+    const int b = c->extended_indices ? U16(f + 2) : U8(f + 1);
+    const int d = c->extended_indices ? U16(f + 4) : U8(f + 2);
+    *ty = U8(f + (c->extended_indices ? 6u : 3u));
     if (a >= n || b >= n || d >= n) {
         return 0;
     }
@@ -594,12 +768,16 @@ static int moby_face(const MobyColl* c, int n, int i, uint32_t fl, Vert* v, int*
 #define PRIMS_MAX 0x400
 
 static gaddr next_prim(const MobyColl* c, uint32_t fl, int* i, int* last) {
-    if (*i == 0 && ((fl & 0x2) != 0 || S32(c->blob + 4) == 0)) {
+    if (*i == 0 && ((fl & 0x2) != 0 || c->primitive_bytes == 0)) {
         return 0;
     }
     const uint32_t disable = U32(c->m + 0x98);
     const int sel = (fl & 0x4) ? 1 : 2;
-    while (!*last && *i < PRIMS_MAX) {
+    /* The console's arena walks up to PRIMS_MAX records, to the one that ends the list; an
+     * expanded one to the end of the blob's records. */
+    const int expanded = c->extended_indices || openrac_guest_ram_size > GUEST_RAM_SIZE;
+    const uint32_t primitive_count = expanded ? c->primitive_bytes / 0x20u : PRIMS_MAX;
+    while (!*last && (uint32_t)*i < primitive_count) {
         const int k = (*i)++;
         const gaddr p = c->blob + 0x10 + 0x20 * (gaddr)k;
         const int16_t mask = S16(p + 2);
@@ -1000,7 +1178,8 @@ typedef struct {
 } LineCell;
 
 #define DDA_MAX 256
-static LineCell g_list[3 * DDA_MAX + 2];
+#define EXTENDED_DDA_MAX 32768
+static LineCell g_list[3 * EXTENDED_DDA_MAX + 2];
 
 /* `vmini`/`vmax` of the endpoints and the [0, 1024)^3 test from the MAC sign flags, in two steps:
  * the low corner not below 0, the high corner below 1024. */
@@ -1013,9 +1192,10 @@ static int in_world_lo(V3 a, V3 b) {
     return 1;
 }
 
-static int in_world_hi(V3 a, V3 b) {
+static int in_world_hi(V3 a, V3 b, int extended) {
+    const float limit = extended ? 131072.0f : K1024;
     for (int k = 0; k < 3; ++k) {
-        if (!neg(fsub(fmax2(a.v[k], b.v[k]), K1024))) {
+        if (!neg(fsub(fmax2(a.v[k], b.v[k]), limit))) {
             return 0;
         }
     }
@@ -1051,7 +1231,8 @@ static int line_cell_list(V3 a1024, V3 b1024) {
     /* the walk keeps the start in vf2 (vmove.xyz) and turns it once per axis (vmr32): its w ends as
      * z */
     g_vf2w = fb(a1024.v[2]);
-    static int32_t lists[3][DDA_MAX + 1];
+    static int32_t lists[3][EXTENDED_DDA_MAX + 1];
+    const int max_steps = openrac_guest_ram_size > GUEST_RAM_SIZE ? EXTENDED_DDA_MAX : DDA_MAX;
     int len[3] = {0, 0, 0}, dir[3];
     const V3 d = vsub(b1024, a1024);
     for (int k = 0; k < 3; ++k) {
@@ -1067,7 +1248,7 @@ static int line_cell_list(V3 a1024, V3 b1024) {
             step = -1;
         }
         dir[k] = step;
-        while (at != end && len[k] < DDA_MAX) {
+        while (at != end && len[k] < max_steps) {
             at += step;
             const float t = fmul(fsub((float)(at << 12), a1024.v[k]), q);
             int32_t bits = (int32_t)fb(t);
@@ -1125,7 +1306,9 @@ static void line_world(
         const V3 centre = v3((float)ci[0], (float)ci[1], (float)ci[2]);
         const V3 a_rel = vsub(a1024, centre);
         const V3 b_rel = vsub(b1024, centre);
-        decode_vertices(&cell, lo, hi);
+        if (!decode_vertices(&cell, lo, hi)) {
+            continue;
+        }
         int vi[3], ty;
         for (int j = 0; cell_triangle(&cell, j, vi, &ty); ++j) {
             const Vert* v0 = &g_verts[vi[0]];
@@ -1275,14 +1458,24 @@ static void line_mobys(
     float* best_t,
     Best* best
 ) {
-    static unsigned cells[3 * DDA_MAX + 2][2];
+    static unsigned cells[3 * EXTENDED_DDA_MAX + 2][2];
     int nc = 0;
     for (int i = 0; i < n; ++i) {
         if (i > 0 && fb(g_list[i].t) == 0x3F800000u) {
             break;
         }
-        const unsigned gx = (unsigned)(g_list[i].c[0] & 0xFF) >> 2,
-                       gy = (unsigned)(g_list[i].c[1] & 0xFF) >> 2;
+        unsigned gx, gy;
+        if (openrac_guest_ram_size > GUEST_RAM_SIZE) {
+            if (g_list[i].c[0] < 0 || g_list[i].c[0] >= 32768 || g_list[i].c[1] < 0
+                || g_list[i].c[1] >= 32768) {
+                continue;
+            }
+            gx = (unsigned)g_list[i].c[0] >> 2;
+            gy = (unsigned)g_list[i].c[1] >> 2;
+        } else {
+            gx = (unsigned)(g_list[i].c[0] & 0xFF) >> 2;
+            gy = (unsigned)(g_list[i].c[1] & 0xFF) >> 2;
+        }
         if (nc == 0 || cells[nc - 1][0] != gx || cells[nc - 1][1] != gy) {
             cells[nc][0] = gx;
             cells[nc][1] = gy;
@@ -1407,7 +1600,7 @@ static int coll_line(const Ctx* x, gaddr pa, gaddr pb, uint32_t fl, gaddr ignore
         return 0;
     }
     vf_int(29, b1024);
-    if (!in_world_hi(a, b)) {
+    if (!in_world_hi(a, b, collision_has_extended_tree(U32(x->out)))) {
         return 0;
     }
     const int n = line_cell_list(a1024, b1024);
@@ -1443,7 +1636,9 @@ typedef struct {
     int capsule;
 } Volume;
 
-static int volume_new(Volume* v, gaddr centre, float radius, float height, int capsule) {
+static int volume_new(
+    Volume* v, gaddr centre, float radius, float height, int capsule, int extended
+) {
     const V3 c = vld(centre);
     v->capsule = capsule;
     for (int k = 0; k < 3; ++k) {
@@ -1463,7 +1658,7 @@ static int volume_new(Volume* v, gaddr centre, float radius, float height, int c
         return 0;
     }
     for (int k = 0; k < 3; ++k) {
-        if (!neg(fsub(v->hi.v[k], K1024))) {
+        if (!neg(fsub(v->hi.v[k], extended ? 131072.0f : K1024))) {
             return 0;
         }
     }
@@ -1514,6 +1709,17 @@ static void volume_mobys(
     for (int k = 0; k < 2; ++k) {
         lo[k] = (uint32_t)ftoi0(vol->lo1024.v[k]) >> 14;
         hi[k] = (uint32_t)ftoi0(vol->hi1024.v[k]) >> 14;
+    }
+    if (openrac_guest_ram_size > GUEST_RAM_SIZE) {
+        if (lo[0] >= 8192 || lo[1] >= 8192 || lo[0] > hi[0] || lo[1] > hi[1]) {
+            return;
+        }
+        if (hi[0] >= 8192) {
+            hi[0] = 8191;
+        }
+        if (hi[1] >= 8192) {
+            hi[1] = 8191;
+        }
     }
     for (unsigned gy = lo[1]; gy <= hi[1]; ++gy) {
         for (unsigned gx = lo[0]; gx <= hi[0]; ++gx) {
@@ -1631,7 +1837,8 @@ static int coll_volume(
         return 0;
     }
     Volume vol;
-    if (!volume_new(&vol, centre, radius, height, capsule)) {
+    const gaddr mesh = U32(x->out);
+    if (!volume_new(&vol, centre, radius, height, capsule, collision_has_extended_tree(mesh))) {
         return 0;
     }
     const float shrink = best_shrink();
@@ -1639,7 +1846,6 @@ static int coll_volume(
     Best best;
     best_start(&best);
     g_joints = 0;
-    const gaddr mesh = U32(x->out);
     if ((fl & 0x1) == 0) {
         int lo[3], hi[3];
         for (int k = 0; k < 3; ++k) {
@@ -1676,7 +1882,9 @@ static int coll_volume(
                         bhi[k] = (int16_t)ftoi0(fsub(vol.hi1024.v[k], cen.v[k]));
                     }
                     const V3 c_rel = vsub(vol.c1024, cen);
-                    decode_vertices(&cell, blo, bhi);
+                    if (!decode_vertices(&cell, blo, bhi)) {
+                        continue;
+                    }
                     int vi[3], ty;
                     for (int j = 0; cell_triangle(&cell, j, vi, &ty); ++j) {
                         const Vert* v0 = &g_verts[vi[0]];
@@ -1921,7 +2129,7 @@ int func_L00_001F2BE8(float a0, gaddr a1, int a2, gaddr a3, gaddr a4) {
     Volume vol;
     g_joints = 0;
     g_r7 = x->grid;
-    if (stamp >= 0 && volume_new(&vol, a1, a0, 0.0f, 0)) {
+    if (stamp >= 0 && volume_new(&vol, a1, a0, 0.0f, 0, openrac_guest_ram_size > GUEST_RAM_SIZE)) {
         const V3 c = vol.c1024;
         const float r = vol.r1024;
         const float best = vol.rr;
@@ -1930,6 +2138,19 @@ int func_L00_001F2BE8(float a0, gaddr a1, int a2, gaddr a3, gaddr a4) {
         for (int k = 0; k < 2; ++k) {
             lo[k] = (uint32_t)ftoi0(vol.lo.v[k]) >> 4;
             hi[k] = (uint32_t)ftoi0(vol.hi.v[k]) >> 4;
+        }
+        if (openrac_guest_ram_size > GUEST_RAM_SIZE) {
+            if (lo[0] >= 8192 || lo[1] >= 8192 || lo[0] > hi[0] || lo[1] > hi[1]) {
+                /* Keep the retail output/list finalization below, but visit no grid cells. */
+                lo[1] = 1;
+                hi[1] = 0;
+            }
+            if (hi[0] >= 8192) {
+                hi[0] = 8191;
+            }
+            if (hi[1] >= 8192) {
+                hi[1] = 8191;
+            }
         }
         for (unsigned gy = lo[1]; gy <= hi[1]; ++gy) {
             for (unsigned gx = lo[0]; gx <= hi[0]; ++gx) {

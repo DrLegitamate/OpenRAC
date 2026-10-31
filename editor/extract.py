@@ -84,6 +84,23 @@ def ours(path: Path, kind: str) -> None:
                           code="folder-not-ours")
 
 
+def ours_packed(path: Path, version: str) -> None:
+    """Refuses to replace a non-empty directory unless it is this version's RAC1 pack."""
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise FormatError(f"{path} is not a packed-level folder; choose another folder", code="pack-folder-not-ours")
+    if not any(path.iterdir()):
+        return
+    try:
+        manifest = json.loads((path / "packed.json").read_text())
+    except (OSError, ValueError):
+        manifest = None
+    if not isinstance(manifest, dict) or manifest.get("game") != "rac1" or manifest.get("version") != version:
+        raise FormatError(f"{path} holds files that are not a RAC1 {version.upper()} packed-level export; "
+                          "choose another folder", code="pack-folder-not-ours")
+
+
 def level_schema(level_dir: Path) -> int | None:
     """The level.json schema a Godot level was written with, None when it has none."""
     try:
@@ -248,18 +265,32 @@ def publish(path: Path, build, anywhere: bool = False, replace: bool = False) ->
     dest = output_path(path, anywhere, replace)
     dest.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{dest.name}-", dir=dest.parent))
+    old = None
     try:
         build(temporary)
         if dest.exists():
             old = Path(tempfile.mkdtemp(prefix=f".{dest.name}-old-", dir=dest.parent))
-            file_ops.rename(dest, old / dest.name)
-            file_ops.rename(temporary, dest)
+            backup = old / dest.name
+            file_ops.rename(dest, backup)
+            try:
+                file_ops.rename(temporary, dest)
+            except BaseException:
+                # The completed build is not published. Put the previous directory back;
+                # if the filesystem also refuses that rename, leave the backup recoverable.
+                try:
+                    if not dest.exists() and backup.exists():
+                        file_ops.rename(backup, dest)
+                except OSError:
+                    pass
+                raise
             shutil.rmtree(old)
         else:
             file_ops.rename(temporary, dest)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
+        if old is not None and old.exists() and not (old / dest.name).exists():
+            shutil.rmtree(old)
     return dest
 
 
@@ -618,9 +649,26 @@ def main() -> None:
                     if game != "rac1":
                         raise FormatError(f"{args.project} holds {game}'s levels, which are not packed back yet",
                                           code="game-not-packable")
-                levels, mobys = pack(disc, survey, args.project, dest)
-                print((dest / "changes.txt").read_text(), end="")
-                print(f"Packed {levels} level(s), {mobys} moby edit(s): {dest}")
+                ours_packed(dest, disc.version.key)
+                # Build beside the published pack. An unsupported Godot edit must not leave a
+                # half pack behind or replace the last good one: pack.py records such edits in
+                # changes.txt so authors can see exactly what needs attention.
+                result = {}
+
+                def build_pack(directory: Path) -> None:
+                    levels, mobys = pack(disc, survey, args.project, directory)
+                    report = (directory / "changes.txt").read_text()
+                    incomplete = [line.strip() for line in report.splitlines()
+                                  if line.lstrip().startswith("not packed:")]
+                    if incomplete:
+                        details = "\n".join(f"  {line}" for line in incomplete)
+                        raise FormatError("Some Godot edits could not be packed:\n" + details,
+                                          code="pack-incomplete")
+                    result.update(levels=levels, mobys=mobys, report=report)
+
+                dest = publish(dest, build_pack, args.anywhere, replace=True)
+                print(result["report"], end="")
+                print(f"Packed {result['levels']} level(s), {result['mobys']} moby edit(s): {dest}")
                 say_output(dest)
             else:
                 dest = publish(args.out, lambda out: raw(disc, survey, args.level[0], out))

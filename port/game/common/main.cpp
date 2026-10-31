@@ -34,11 +34,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -393,6 +395,23 @@ int run_game_as_the_ee() {
     return openrac_game_run();
 }
 
+// Keep arena selection in step with lib/cdvd.c's virtual.tsv reader: only a usable row
+// actually routes reads outside the disc and needs the expanded guest RAM path.
+bool has_virtual_sector_mappings(const fs::path& mount) {
+    std::ifstream input(mount / "virtual.tsv");
+    std::string line;
+    while (std::getline(input, line)) {
+        unsigned first = 0;
+        unsigned count = 0;
+        char name[2048] = {};
+        if (std::sscanf(line.c_str(), "%u\t%u\t%2047[^\t\r\n]", &first, &count, name) == 3
+            && count != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -447,7 +466,11 @@ int main(int argc, char** argv) {
 
     if (g_options.check_levels) {
 #ifdef OPENRAC_FRONTEND
-        return check_levels(g_options.levels.empty() ? default_levels(g_options.data) : levels_or_flat(g_options.levels));
+        return check_levels(
+            g_options.levels.empty() ? default_levels(g_options.data)
+                                     : levels_or_flat(g_options.levels),
+            g_options.mods
+        );
 #else
         log::fatalf("--check-levels needs a build with the window (it reads the levels as the window does)");
 #endif
@@ -477,7 +500,20 @@ int main(int argc, char** argv) {
         );
     }
 
-    runtime::Memory::create();
+    std::uint32_t ram_size = GUEST_RAM_SIZE;
+    const bool expanded_streams =
+        (!g_options.ship_map && !g_options.mods.empty()
+         && has_virtual_sector_mappings(g_options.mods))
+        || std::any_of(destination_mounts.begin(), destination_mounts.end(), [](const auto& mount) {
+               return has_virtual_sector_mappings(mount);
+           });
+    if (expanded_streams) {
+        ram_size = GUEST_RAM_EXPANDED_SIZE;
+    }
+    if (ram_size > GUEST_RAM_SIZE) {
+        log::info("expanded level streams enabled: guest RAM is {} MiB", ram_size >> 20);
+    }
+    runtime::Memory::create(ram_size);
     runtime::install_crash_handler();
     // The threads reading a track are stopped before the program exits, whichever way it ends
     // (a window closed, a run of so many frames, an error): a reader that is still working

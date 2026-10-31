@@ -178,7 +178,9 @@ void openrac_game_draw(unsigned layers) {
         // The world's terrain: the camera it is drawn with is the frame's world camera.
         if (g_window && (layers & OPENRAC_DRAW_TERRAIN) != 0) {
             const auto* ram = runtime::Memory::get().base();
-            frontend::world_drawn(std::span<const std::uint8_t>(ram, 32u * 1024 * 1024));
+            frontend::world_drawn(
+                std::span<const std::uint8_t>(ram, runtime::Memory::get().ram_size())
+            );
         }
 #endif
     });
@@ -351,9 +353,12 @@ int openrac_game_mobys_drawn(gaddr first, int count) {
         if (g_window && count > 0) {
             const auto* ram = runtime::Memory::get().base();
             frontend::mobys_drawn(
-                std::span<const std::uint8_t>(ram, 32u * 1024 * 1024), first, count
+                std::span<const std::uint8_t>(ram, runtime::Memory::get().ram_size()), first, count
             );
-            return count <= 0xFF ? 1 : 0;
+            // The console's arena keeps the retail limit (its marker held a byte); an expanded one
+            // a halfword.
+            const bool expanded = runtime::Memory::get().ram_size() > GUEST_RAM_SIZE;
+            return count <= (expanded ? 0xFFFF : 0xFF) ? 1 : 0;
         }
 #else
         (void)first;
@@ -368,7 +373,9 @@ void openrac_game_effect_quad(const openrac_game_quad* quad) {
 #ifdef OPENRAC_FRONTEND
         if (g_window) {
             const auto* ram = runtime::Memory::get().base();
-            frontend::effect_quad(std::span<const std::uint8_t>(ram, 32u * 1024 * 1024), *quad);
+            frontend::effect_quad(
+                std::span<const std::uint8_t>(ram, runtime::Memory::get().ram_size()), *quad
+            );
         }
 #else
         (void)quad;
@@ -430,7 +437,7 @@ void openrac_game_particle(const uint8_t* record, uint32_t pixels, uint32_t clut
         if (g_window) {
             const auto* ram = runtime::Memory::get().base();
             frontend::particle(
-                std::span<const std::uint8_t>(ram, 32u * 1024 * 1024),
+                std::span<const std::uint8_t>(ram, runtime::Memory::get().ram_size()),
                 record,
                 pixels,
                 clut,
@@ -463,8 +470,9 @@ void openrac_game_moby_chain(gaddr moby, gaddr marks) {
     c_boundary::call("openrac_game_moby_chain", [&] {
 #ifdef OPENRAC_FRONTEND
         const auto* ram = runtime::Memory::get().base();
-        const auto pose =
-            scene::moby_pose_matrices(std::span<const std::uint8_t>(ram, 32u * 1024 * 1024), moby);
+        const auto pose = scene::moby_pose_matrices(
+            std::span<const std::uint8_t>(ram, runtime::Memory::get().ram_size()), moby
+        );
         const auto* mark = static_cast<const std::uint8_t*>(G(marks));
         const std::size_t count = std::min<std::size_t>(mark[0x7F], pose.size());
 

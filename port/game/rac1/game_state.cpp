@@ -14,6 +14,8 @@
 #include <iterator>
 #include <string_view>
 
+#include "openrac/guest.h"
+
 namespace openrac::game::rac1 {
 
 /*
@@ -61,7 +63,7 @@ namespace {
 template <typename T>
 T at(std::span<const std::uint8_t> ram, std::uint32_t address) {
     T value{};
-    address &= 0x01FFFFFF;
+    address = openrac_guest_ram_address_for_size(address, static_cast<std::uint32_t>(ram.size()));
     if (address + sizeof(T) <= ram.size()) {
         std::memcpy(&value, ram.data() + address, sizeof(T));
     }
@@ -239,9 +241,15 @@ host::GameState read_game_state(std::span<const std::uint8_t> ram, const GameAdd
 
     // The table starts at the word before moby_first (the mobys the level places, the hero first);
     // moby_first itself is where the spawned ones begin.
-    auto first = at<std::uint32_t>(ram, a.moby_first) & 0x01FFFFFF;
-    const auto end = at<std::uint32_t>(ram, a.moby_end) & 0x01FFFFFF;
-    const auto start = at<std::uint32_t>(ram, a.moby_first - 4) & 0x01FFFFFF;
+    auto first = openrac_guest_ram_address_for_size(
+        at<std::uint32_t>(ram, a.moby_first), static_cast<std::uint32_t>(ram.size())
+    );
+    const auto end = openrac_guest_ram_address_for_size(
+        at<std::uint32_t>(ram, a.moby_end), static_cast<std::uint32_t>(ram.size())
+    );
+    const auto start = openrac_guest_ram_address_for_size(
+        at<std::uint32_t>(ram, a.moby_first - 4), static_cast<std::uint32_t>(ram.size())
+    );
     if (start != 0 && start < first && (first - start) % 0x100 == 0) {
         first = start;
     }
@@ -317,8 +325,14 @@ const GameAddresses& rac1_pal_addresses(std::span<const std::uint8_t> ram) {
 bool load_memory(const std::filesystem::path& path, std::vector<std::uint8_t>& out, std::string& error) {
     std::ifstream f(path, std::ios::binary);
     out.assign(std::istreambuf_iterator<char>(f), {});
-    if (out.size() != 32u * 1024 * 1024) {
-        error = std::format("{}: not a 32 MB memory picture ({} bytes)", path.string(), out.size());
+    if (out.size() != GUEST_RAM_SIZE && out.size() != GUEST_RAM_EXPANDED_SIZE) {
+        error = std::format(
+            "{}: memory picture is {} bytes; expected a 16 MiB multiple from {} through {}",
+            path.string(),
+            out.size(),
+            GUEST_RAM_SIZE,
+            GUEST_RAM_EXPANDED_SIZE
+        );
         return false;
     }
     return true;

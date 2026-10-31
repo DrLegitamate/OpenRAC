@@ -145,7 +145,8 @@ static void mark_drawn_mobys(gaddr first, int count) {
     const int max_distance = GREF(int, OPENRAC_DATA(RAC1_ADDR(0x00160030u)));
     const uint8_t* groups = G(OPENRAC_DATA(RAC1_ADDR(0x001940C0u)));
     for (gaddr m = first; count < 0 || m != end; m += 0x100) {
-        if (m - first >= 0x100u * 4096u) {
+        /* At most 4096 mobys in the console's arena, as before; an expanded one holds more. */
+        if (m - first >= 0x100u * (openrac_guest_ram_size > GUEST_RAM_SIZE ? 32768u : 4096u)) {
             break;
         }
         uint8_t* b = G(m);
@@ -181,10 +182,10 @@ int func_00212658(int a0, int a1, int a2, int a3) {
     mark_drawn_mobys((gaddr)a0, a2);
     openrac_game_draw(OPENRAC_DRAW_MOBYS);
     if (openrac_game_mobys_drawn((gaddr)a0, a2)) {
-        /* A moby marker in the display list (put_marker), the count in bits 32-39 and the first
+        /* A moby marker in the display list (put_marker), the count in bits 32-47 and the first
          * moby in the low word: the mobys of a screen the game renders to a texture (the vendor's
          * item and salesman) are drawn into it there. */
-        put_marker((0x4D42ull << 48) | ((uint64_t)(a2 & 0xFF) << 32) | (uint32_t)a0);
+        put_marker((0x4D42ull << 48) | ((uint64_t)(a2 & 0xFFFF) << 32) | (uint32_t)a0);
     }
     (void)a0;
     (void)a1;
@@ -303,6 +304,12 @@ void func_0022CC40(gaddr a0) {
     (void)a0;
 }
 
+/* A mapped level may place its sky data in the expanded arena. Check guest spans against active RAM
+ * before converting their addresses through G(). */
+static int sky_ram_span(gaddr at, uint32_t bytes) {
+    return at <= openrac_guest_ram_size && bytes <= openrac_guest_ram_size - at;
+}
+
 /*
  * SkySpriteProc: the sky's sprites (stars, glows), from the sky header (+0x08 their count, +0x10 the
  * texture table, 16 bytes an entry with the TEX0 first, +0x1C the 0x20-byte records; a negative
@@ -311,22 +318,30 @@ void func_0022CC40(gaddr a0) {
 void func_0022CEB8(void) {
     openrac_game_draw(OPENRAC_DRAW_SKY);
     const gaddr sky = GREF(gaddr, OPENRAC_DATA(RAC1_ADDR(0x0016055Cu)));
-    if (sky == 0 || sky >= 0x01FFF000u) {
+    if (sky == 0 || !sky_ram_span(sky, 0x20u)) {
         return;
     }
     const gaddr records = GREF(gaddr, sky + 0x1C);
-    const int count = GREF(uint16_t, sky + 0x08);
+    const unsigned count = GREF(uint16_t, sky + 0x08);
     const gaddr textures = GREF(gaddr, sky + 0x10);
-    if (records == 0 || textures == 0 || records >= 0x01FFF000u) {
+    if (records == 0 || textures == 0 || !sky_ram_span(records, count * 0x20u)) {
         return;
     }
-    for (int i = 0; i < count && i < 1024; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
         const uint8_t* r = G(records + (gaddr)i * 0x20);
         if ((int8_t)r[2] < 0) {
             continue;
         }
+        const uint32_t texture_offset = (uint32_t)r[2] * 16u;
+        if (textures > UINT32_MAX - texture_offset) {
+            return;
+        }
+        const gaddr texture = textures + texture_offset;
+        if (!sky_ram_span(texture, sizeof(uint64_t))) {
+            return;
+        }
         uint64_t tex0;
-        memcpy(&tex0, G(textures + (gaddr)r[2] * 16), 8);
+        memcpy(&tex0, G(texture), sizeof(tex0));
         openrac_game_sky_sprite(r, tex0);
     }
 }

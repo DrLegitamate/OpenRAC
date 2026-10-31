@@ -96,7 +96,7 @@ std::optional<FrameRange> env_frames(env::Var var) {
 
 std::uint32_t word_at(std::span<const std::uint8_t> ram, std::uint32_t at) {
     std::uint32_t w = 0;
-    at &= 0x01FFFFFF;
+    at = openrac_guest_ram_address_for_size(at, static_cast<std::uint32_t>(ram.size()));
     if (at + 4 <= ram.size()) {
         std::memcpy(&w, ram.data() + at, 4);
     }
@@ -121,7 +121,8 @@ std::vector<std::uint8_t> direct_packets(
     std::size_t* world_marker = nullptr
 ) {
     std::vector<std::uint8_t> vif;
-    std::uint32_t tag_at = chain & 0x01FFFFF0;
+    std::uint32_t tag_at =
+        openrac_guest_ram_address_for_size(chain, static_cast<std::uint32_t>(ram.size())) & ~0xFu;
     std::uint32_t stack[2] = {0, 0};
     int depth = 0;
     // For OPENRAC_DRAW_COVERAGE, where each run of the VIF data came from in game memory (the
@@ -129,7 +130,7 @@ std::vector<std::uint8_t> direct_packets(
     const bool covering = strips != nullptr && draw_coverage::armed();
     std::vector<std::pair<std::size_t, std::uint32_t>> origins;
     auto append = [&](std::uint32_t at, std::uint32_t bytes) {
-        at &= 0x01FFFFFF;
+        at = openrac_guest_ram_address_for_size(at, static_cast<std::uint32_t>(ram.size()));
         if (at + bytes <= ram.size()) {
             if (covering) {
                 origins.emplace_back(vif.size(), at);
@@ -797,7 +798,7 @@ bool run_over() {
 
 // Writes the game's main memory at the frame OPENRAC_DUMP_RAM names.
 void dump_ram(std::span<const std::uint8_t> ram) {
-    // OPENRAC_DUMP_RAM=FRAME: the game's 32 MB of main memory at that frame, to ram_FRAME.bin.
+    // OPENRAC_DUMP_RAM=FRAME: the game's active main memory at that frame, to ram_FRAME.bin.
     static const std::optional<std::uint64_t> dump_ram = env_frame(env::Var::DumpRam);
     if (dump_ram && g->index == *dump_ram) {
         const std::string path = std::format("ram_{}.bin", g->index);

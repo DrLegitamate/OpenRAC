@@ -128,6 +128,17 @@ struct Instance {
     bool gameplay_essential = false;  // Eligible for enhanced lighting's subtle GI-coloured rim.
 };
 
+struct SpinAnimation {
+    std::size_t instance = 0;  // Index in Layer::Animated.
+    Vec3 axis{0.0f, 0.0f, 1.0f};
+    float radians_per_second = 0.0f;
+    float phase = 0.0f;
+    Vec3 move_axis{0.0f, 0.0f, 0.0f};
+    float move_distance = 0.0f;
+    float move_radians_per_second = 0.0f;
+    float move_phase = 0.0f;
+};
+
 // What the viewer draws, in the game's order.
 enum class Layer : std::uint8_t {
     Sky,
@@ -135,6 +146,7 @@ enum class Layer : std::uint8_t {
     Ties,
     Shrubs,
     Mobys,
+    Animated,  // last: the layers before it keep their numbers (the picker's ids, saved data)
     Count
 };
 
@@ -168,6 +180,8 @@ struct LevelData {
     // the GS blends however the export's alpha mode reads (material_index).
     std::vector<bool> translucent_images;
     std::array<std::vector<Instance>, kLayerCount> instances;
+    // Mod-only rigid prop animation. Empty for retail levels and mods without animated.json.
+    std::vector<SpinAnimation> spins;
     // Moby classes: model and whether it is the stand-in box, for placing live mobys.
     std::map<int, std::pair<std::uint32_t, bool>> moby_classes;
 

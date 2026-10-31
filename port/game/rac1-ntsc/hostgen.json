@@ -23,6 +23,7 @@
     "src"
   ],
   "defines": [
+    "OPENRAC_HAS_DISC=1",
     "LOMBYTE_QZERO_H",
     "LOMBYTE_MOBY_UPDATE_H",
     "MOBY_CALL_UPDATE(update,moby)=do { if (update) (update)(moby); } while (0)"
@@ -56,6 +57,7 @@
     1437440,
     2424832
   ],
+  "expanded_target_table_addresses": ["0x001ABA00"],
   "returns_64": [
     "FUN_001f44b8"
   ],
@@ -80,6 +82,9 @@
     "func_001E9478"
   ],
   "host_functions": [
+    "rac1_expanded_ram",
+    "rac1_check_level_heap",
+    "rac1_update_expanded_moby_grid",
     "FUN_00212d68",
     "openrac_game_moby_colour",
     "FUN_001f7580",
