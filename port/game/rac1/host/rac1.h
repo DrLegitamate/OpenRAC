@@ -47,6 +47,11 @@ void rac1_options_frame(void);
  * header's spare moby count raised while the level loader runs. */
 void rac1_wad_decompressed(gaddr to);
 
+/* scene_actors.c: hide the scene's missing actors during the flight update (pack), then
+ * restore the list (unpack). */
+void rac1_scene_actors_pack(void);
+void rac1_scene_actors_unpack(void);
+
 /* boot.c: the level programs ParseBin loaded since the start. */
 uint32_t rac1_program_loads(void);
 
