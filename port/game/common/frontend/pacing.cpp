@@ -61,4 +61,21 @@ bool frame_may_start(double cap, steady_clock::time_point due, steady_clock::tim
            || now + std::chrono::milliseconds(1) >= due;
 }
 
+double present_lead(double cost, double spread, double step) {
+    // What a frame begun this much early still covers: the wake of a wait and the swap's own call.
+    constexpr double kMargin = 0.0005;
+    return std::clamp(cost + 3.0 * spread + kMargin, 0.0, std::max(step, 0.0));
+}
+
+double tick_slip(double step, double period, double lag, double tick_work) {
+    return std::max(0.0, std::min({step, lag * period, 0.5 * period - tick_work}));
+}
+
+steady_clock::time_point cap_start(CapEdge edge, steady_clock::time_point due, double lead) {
+    if (edge == CapEdge::Start || due.time_since_epoch().count() == 0) {
+        return due;
+    }
+    return due - duration_cast<steady_clock::duration>(duration<double>(lead));
+}
+
 }  // namespace openrac::frontend

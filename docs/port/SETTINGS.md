@@ -163,6 +163,26 @@ With VSync on or adaptive, a numeric cap is an upper bound: a 120 FPS cap on a
 share one deadline, so asynchronous Vulkan presentation does not add a second
 refresh-length sleep to the game tick.
 
+How the frame cap keeps frames even:
+
+- **VSync off, low-latency frames off, a cap above the game's tick rate**
+  (for example 120 or 144): each frame has a fixed time on the screen, one cap
+  frame after the last. The frame is drawn a little before that time, then
+  waits for it and is shown exactly on time. The picture is drawn for that
+  moment too, so the motion is even. A tick may start a few milliseconds late
+  to let such a frame out first (never more than half a tick). The game's
+  logic does not change. The cost is about 1-2 ms more input latency.
+- **Everything else** (VSync on, low-latency frames on, a cap of 60 or less,
+  Android): a frame starts at its time and is shown as soon as it is drawn.
+  With VSync on the display already keeps frames even. With a cap of 60 or
+  less each frame belongs to one tick and cannot start before the tick ends.
+  On Android a frame is only ever shown at the next refresh.
+
+All of these waits are precise to a few microseconds
+(`port/common/precise_wait.h`). The system sleeps until just before the time
+and the last bit is a short busy wait. A plain sleep can wake up a millisecond
+or more late, which shows as an uneven frame.
+
 The display's refresh rate is read when the window says it moved to another
 display or the display changed mode, not polled.
 

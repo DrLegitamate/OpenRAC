@@ -21,7 +21,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <volk.h>
 
@@ -29,6 +28,7 @@
 
 #include "common/env.h"
 #include "common/log.h"
+#include "common/precise_wait.h"
 #include "common/stats.h"
 #include "renderer/gpu_draw.h"
 #include "renderer/vulkan/vkgl_internal.h"
@@ -357,7 +357,12 @@ int set_swap_interval(int interval) {
         return interval;
     }
     const VkPresentModeKHR mode = present_mode();
+    g->shows_at_once = mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
     return mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? -1 : mode == VK_PRESENT_MODE_FIFO_KHR ? 1 : 0;
+}
+
+bool swap_shows_at_once() {
+    return active() && g->shows_at_once;
 }
 
 void set_low_latency(bool on) {
@@ -393,7 +398,7 @@ double latency_sleep(std::chrono::steady_clock::time_point limit) {
         return 0.0;
     }
     const stats::Scope sleep("latency sleep");
-    std::this_thread::sleep_until(until);
+    precise_wait::until(until);
     return seconds_since(start);
 }
 
