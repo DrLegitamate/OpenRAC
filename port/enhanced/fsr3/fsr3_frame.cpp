@@ -3,6 +3,7 @@
 //
 // Fsr3 frame resolve: velocities, particle reactivity, SDK dispatch and displayed-pose history.
 #include <cmath>
+#include <utility>
 
 #include "common/log.h"
 #include "common/stats.h"
@@ -112,9 +113,11 @@ void Fsr3::State::draw_camera_motion() {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, world.depth_texture());
     glBindFramebuffer(GL_FRAMEBUFFER, depth.framebuffer());
+    fsr3_detail::let_go_colour();
     glUniform1i(camera_motion.uniform("depth_only"), 1);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindFramebuffer(GL_FRAMEBUFFER, motion.framebuffer());
+    fsr3_detail::let_go_colour();
     glUniform1i(camera_motion.uniform("depth_only"), 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -156,6 +159,7 @@ void Fsr3::State::draw_reactive() {
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, reactive.framebuffer());
+    fsr3_detail::let_go_colour();
     glBindVertexArray(vao);
     reactive_mask.use();
     glActiveTexture(GL_TEXTURE0);
@@ -198,7 +202,9 @@ void Fsr3::State::restore_world_depth() {
 void Fsr3::State::resolve(renderer::RenderTarget& target) {
     const stats::Scope timing("FSR frame resolve");
     draw_motion();
-    draw_reactive();
+    if (!plain) {
+        draw_reactive();  // the upscaler's alone
+    }
     std::string error;
     // Select the reference before dispatch: only frames that will blur borrow its output.
     const bool blur_frame = !dispatch.reset && !blur_mode_changed && blur_strength > 0
@@ -207,7 +213,8 @@ void Fsr3::State::resolve(renderer::RenderTarget& target) {
                        : camera_blur ? std::optional{renderer::Vec3{}}
                                      : fsr3_detail::reference_displacement(camera, old_camera);
     const unsigned blur_output =
-        delta && renderer::render_opt::enabled(renderer::render_opt::Opt::MotionBlurFastPath)
+        delta && !plain
+                && renderer::render_opt::enabled(renderer::render_opt::Opt::MotionBlurFastPath)
             ? blur.reconstruction_output(display.width, display.height)
             : 0;
     const std::array<unsigned, 5> inputs{
@@ -219,14 +226,19 @@ void Fsr3::State::resolve(renderer::RenderTarget& target) {
     };
     const bool resolved = [&] {
         const stats::Scope upscaler("FSR upscaler", stats::kGpu);
-        return sdk.dispatch(inputs, dispatch, error);
+        if (plain) {
+            world.blit_to(display.framebuffer, display.width, display.height);
+            return true;
+        }
+        return dispatch_upscaler(inputs, error);
     }();
 
-    // A rejected dispatch still presents a complete world and full-resolution HUD, then stops retrying.
+    // A rejected dispatch still presents a complete world and full-resolution HUD, then stops
+    // retrying; a failed Arm ASR dispatch instead leaves FSR 3.1 to the next frame.
     if (!resolved) {
         log::error("{}", error);
         world.blit_to(display.framebuffer, display.width, display.height);
-        failed = true;
+        failed = !std::exchange(asr_dispatch_failed, false);
     }
 
     if (resolved && delta) {

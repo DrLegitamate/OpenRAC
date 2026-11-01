@@ -1842,3 +1842,58 @@ pairs, while the separate integer improved in four raw pairs. Total effects CPU 
 unchanged. These support pass-specific savings, not an overall FPS promise. Other levels,
 GPUs and drivers can differ. Native Windows Vulkan was exercised; Android/macOS hardware and
 OpenGL execution require their own validation.
+
+## Tile-based GPUs
+
+Phone GPUs (Arm Mali, Qualcomm Adreno, Apple, Imagination) bin each pass's geometry and keep its
+attachments in tile memory; what they pay for is vertex binning and the bytes a pass loads from
+and stores to memory, not the pixels it shades. `vkgl::tile_based()` says whether the device is
+one: the vendor ID decides, and `OPENRAC_TILE_BASED=1` or `0` overrides it, so a desktop GPU can
+run the same paths. The capture report's `gpu passes` line records it.
+
+- **`shadow-depth-only`.** The shadow atlas, the static shadow cache and the scrolling caches
+  are a float depth image alone. Before, each also had an RGBA8 colour and a stencil attachment
+  that nothing read, which a tile-based GPU cleared and stored every frame.
+- **`msaa-pass-resolve`.** A blit that resolves a whole multisampled colour image into a
+  single-sampled one of the same size and format, while the multisampled image's pass is still
+  open, becomes that pass's resolve attachment. The samples never leave tile memory; before,
+  the pass stored them and a separate resolve read them back.
+- **`fsr-reactive-r8`.** The upscaler's reactive mask is one R8 channel instead of RGBA8; the
+  upscaler reads only its red channel.
+- **`motion-blur-adaptive-samples`.** The blur's gather takes two samples a display pixel of
+  each trail's length (at least 8) instead of always `motion_blur_samples` (two thirds of it
+  along the receiver's own trail): a short trail no longer samples the same texels many times.
+  Not byte-identical: on Novalis while turning, up to about 20% of pixels differ, under 0.2% by
+  more than 4 of 255 and none by more than 32; the trails look the same.
+- **`attachment-untouched`.** A deferred Vulkan pass whose draws and clears never touch an
+  attachment (no colour write, no depth or stencil test, no clear) gives it the load and store
+  operation NONE (`VK_EXT_load_store_op_none` or `VK_KHR_load_store_op_none`): the attachment
+  is neither read in nor written back, and keeps what it held. Before, such a pass loaded and
+  stored it anyway, for example the display depth in the copy to the screen. Byte-identical.
+- **`pass-render-area`.** A deferred Vulkan pass's render area is the rectangle its draws
+  (their scissors, or their indexed viewports) and clears touched, so it loads and stores only
+  that rectangle. When the first thing in the pass is a clear of that whole rectangle, the pass
+  begins cleared instead of loading it (the clear stays in the pass, so its value is the one
+  seen). A clear the pass begins with, and an in-pass resolve, make the area the whole target.
+  Byte-identical.
+- **`overwrite-discard`.** The temporal targets a full-screen draw overwrites whole (camera
+  motion, its depth copy, the reactive mask), the blur's velocity and jump flood targets, and
+  the display under the copying blur gather are let go (`glInvalidateFramebuffer`) before the
+  draw, so the pass does not load them. Byte-identical; the equivalence test's poison mode
+  checks that nothing reads what was let go.
+- **Arm ASR.** On a Qualcomm (Snapdragon) GPU the temporal module upscales with Arm Accuracy Super
+  Resolution (`port/enhanced/asr/README.md`), whose fragment passes suit these GPUs better than
+  FSR 3.1's compute passes. `OPENRAC_TEMPORAL_UPSCALER=asr` or `fsr3` chooses either one on any
+  GPU; the capture report's `enhanced` line names the one in use.
+- **Pass timing.** Timestamps written inside an open render pass on a tile-based GPU measure
+  the binning, not the shading, so the capture's per-pass GPU column reads about zero there.
+  A recording ends the pass around each GPU timer in one frame of ten (every frame with
+  `OPENRAC_GPU_PASS_TIMING`): those frames give each section's own time, at the cost of extra
+  loads and stores, and are left out of the frame's GPU time.
+
+The registry entries above, except `motion-blur-adaptive-samples`, are lossless:
+`render_equivalence_vulkan --opt <name>` compares frames with each one on and off with no
+tolerance. The scrolling static shadow caches above
+would save the most binning on these GPUs, but they are not the default there: their texel-snapped
+cascades and unfitted caster bounds change the shadows' pixels (`sun_shadow_vulkan` with
+`OPENRAC_TILE_BASED=1`), so they stay behind `OPENRAC_SCROLLING_SHADOWS`.

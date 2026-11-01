@@ -13,6 +13,7 @@
 #include <imgui_internal.h>  // ImHashStr, ShadeVertsLinearColorGradientKeepAlpha: the eases and gradients
 #include <span>
 #include <string>
+#include <string_view>
 
 #include <SDL3/SDL.h>
 
@@ -313,7 +314,7 @@ void drawer_note(const char* line) {
     ImGui::Dummy(ImVec2(0.0f, dp(10.0f)));
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + dp(16.0f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui().soft));
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + s.card.width - dp(32.0f));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - dp(16.0f));
     ImGui::TextUnformatted(line);
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
@@ -410,13 +411,16 @@ void drawer_enhanced() {
                 changed = true;
             }
         }
-        // AMD FSR's temporal upscaling (enhanced/fsr3): its preset, and its sharpening while on
-        // (the launcher's steps of 0.05).
+        // Temporal upscaling (enhanced/fsr3, with Arm ASR or AMD FSR 3.1, the one in use named):
+        // its preset, and its sharpening while on (the launcher's steps of 0.05).
         if (enhanced::Fsr3::available()) {
             constexpr int kModes = static_cast<int>(renderer::TemporalQuality::Count);
             const int mode = static_cast<int>(set.temporal_quality);
+            const std::string_view upscaler = enhanced::Fsr3::active_upscaler();
+            const std::string label = upscaler == "none" ? std::string("Upscaling")
+                                                         : std::format("Upscaling ({})", upscaler);
             if (const int by = drawer_choice(
-                    "FSR upscaling", renderer::kTemporalNames[mode], mode > 0, mode < kModes - 1
+                    label.c_str(), renderer::kTemporalNames[mode], mode > 0, mode < kModes - 1
                 )) {
                 set.temporal_quality =
                     static_cast<renderer::TemporalQuality>(std::clamp(mode + by, 0, kModes - 1));
@@ -425,7 +429,7 @@ void drawer_enhanced() {
             if (set.temporal_quality != renderer::TemporalQuality::Off) {
                 const float sharp = set.temporal_sharpness;
                 if (const int by = drawer_choice(
-                        "FSR sharpening",
+                        "Sharpening",
                         std::format("{:.0f}%", sharp * 100.0f),
                         sharp > 0.025f,
                         sharp < 0.975f
@@ -672,19 +676,57 @@ void drawer(const Shown& shown) {
                 s.shot_when_shut = true;
                 set_drawer(false);
             }
-            // A performance capture: starts a moment after the drawer has gone; opening it again
-            // ends the capture, whose report is copied and saved (debug/capture.cpp).
-            if (const int by =
-                    drawer_choice("Recording length", capture_length_name(), true, true)) {
-                step_capture_length(by);
-            }
-            if (drawer_row(
-                    capture_pending() ? "Cancel recording diagnostics" : "Record diagnostics"
-                )) {
-                const bool starts = !capture_pending();
-                toggle_capture(true);
-                if (starts) {
-                    set_drawer(false);
+            // Diagnostics recordings (debug/capture.cpp): one row that unfolds the two kinds,
+            // each with a line on when to use it. A recording starts a moment after the drawer
+            // has gone; opening the drawer again ends it, and its report is copied and saved.
+            if (capture_pending()) {
+                if (drawer_row("Cancel recording")) {
+                    toggle_capture(true);
+                }
+            } else {
+                const bool record = s.drawer_record;
+                if (drawer_row(
+                        "Record diagnostics", ui().text, [record](ImDrawList* list, ImVec2 right) {
+                            const float k = tween(item_part("open"), record ? 1.0f : 0.0f, kMedium);
+                            const float dy = 1.0f - 2.0f * k;
+                            arrow(
+                                list,
+                                ImVec2(right.x - dp(5.0f), right.y + dp(2.5f) * dy),
+                                0.0f,
+                                dy,
+                                ui().soft
+                            );
+                        }
+                    )) {
+                    s.drawer_record = !s.drawer_record;
+                }
+                if (record) {
+                    // Its two kinds set in under it, so they read as its own.
+                    ImGui::Indent(dp(16.0f));
+                    if (drawer_row("Gameplay recording")) {
+                        toggle_capture(true);
+                        set_drawer(false);
+                    }
+                    drawer_note(
+                        "Records while you play, for the length below. Use it to catch stutters "
+                        "or a slow place or moment."
+                    );
+                    if (const int by =
+                            drawer_choice("Recording length", capture_length_name(), true, true)) {
+                        step_capture_length(by);
+                    }
+                    const std::string sweep_label =
+                        std::format("Graphics settings sweep ({:.0f} s)", settings_sweep_seconds());
+                    if (drawer_row(sweep_label.c_str())) {
+                        toggle_settings_sweep();
+                        set_drawer(false);
+                    }
+                    drawer_note(
+                        "Stand still while it runs: it changes the graphics settings every few "
+                        "seconds, with VSync off, and measures what each one costs. Use it when "
+                        "the game is slow everywhere."
+                    );
+                    ImGui::Unindent(dp(16.0f));
                 }
             }
             // A weaker device's processor, for testing how the game copes (common/slow_cpu.h).

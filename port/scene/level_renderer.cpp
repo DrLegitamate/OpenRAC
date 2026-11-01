@@ -227,8 +227,18 @@ bool LevelScene::upload(
         }
         static_translucent =
             renderer::shader_constants(std::move(static_translucent), {{"translucent_pass", 1}});
+        // The default blended static pass reads cheaper probe light and shadows (Enhanced is
+        // allowed to be lossy); the full one stays as the reference.
+        std::string static_fast(static_translucent);
+        static_fast.insert(static_fast.find('\n') + 1, "#define OPENRAC_PROBE_FAST 1\n");
         if (!m_static_translucent
-                 .build("static translucent colour", static_vertex, static_translucent, error)) {
+                 .build("static translucent colour", static_vertex, static_fast, error)
+            || !m_static_translucent_full.build(
+                "static translucent colour, full probe light",
+                static_vertex,
+                static_translucent,
+                error
+            )) {
             return false;
         }
     }
@@ -651,6 +661,7 @@ void LevelScene::release() {
     }
     m_mesh.release();
     m_static_translucent.release();
+    m_static_translucent_full.release();
     m_colour_opaque.release();
     m_early_colour_opaque.release();
     for (auto& shader : m_colour_specialised) {
@@ -1175,13 +1186,22 @@ void LevelScene::draw_layer(
             }
         }
         const bool solid = !mobys && pass == 0;
+        const bool sweep_translucent = !state.depth_prepass && pass == 2;
+        if (sweep_translucent && m_sweep_translucent_off) {
+            continue;
+        }
         const bool reused =
             state.reuse_prepass_depth && !state.depth_prepass && (mobys ? pass == 0 : pass <= 1);
         std::optional<stats::Scope> layer_pass;
-        if (layer == Layer::Ties && !state.depth_prepass && state.opaque_colour_phase < 0) {
-            static constexpr const char* names[] =
-                {"ties solid", "ties cutout", "ties translucent"};
-            layer_pass.emplace(names[pass], stats::kGpu, std::source_location::current());
+        if ((layer == Layer::Terrain || layer == Layer::Ties || layer == Layer::Shrubs)
+            && !state.depth_prepass && state.opaque_colour_phase < 0) {
+            static constexpr const char* names[][3] = {
+                {"terrain solid", "terrain cutout", "terrain translucent"},
+                {"ties solid", "ties cutout", "ties translucent"},
+                {"shrubs solid", "shrubs cutout", "shrubs translucent"},
+            };
+            const int row = layer == Layer::Terrain ? 0 : layer == Layer::Ties ? 1 : 2;
+            layer_pass.emplace(names[row][pass], stats::kGpu, std::source_location::current());
         }
         if (mobys && !state.depth_prepass && state.opaque_colour_phase < 0) {
             layer_pass.emplace(moby_pass_names[pass], stats::kGpu, std::source_location::current());
@@ -1211,7 +1231,11 @@ void LevelScene::draw_layer(
             }
         } else if (static_translucent) {
             // Static blended packets omit moby-only vertex work.
-            selected = &m_static_translucent;
+            static const bool& fast_off = stats::probe(
+                "OPENRAC_PROBE_FAST_OFF", "Reference: full probe light on blended static passes"
+            );
+            selected = fast_off || m_sweep_translucent_full ? &m_static_translucent_full
+                                                            : &m_static_translucent;
         } else if (!specialisation_off && specialised[variant].id()
                    && renderer::render_opt::enabled(renderer::render_opt::Opt::ShaderVariants)
                    && (batch_shader || (mobys ? pass == 0 : pass <= 1))) {
@@ -1248,6 +1272,11 @@ void LevelScene::draw_layer(
             set_wrap = -1;
             set_cutout = -1;
             colour_set = false;
+        }
+        if (sweep_translucent && m_sweep_translucent_unlit) {
+            glUniform1i(program->uniform("probe_mode"), 0);
+            glUniform1i(program->uniform("sun_shadow_enabled"), 0);
+            glUniform1i(program->uniform("hero_shadow_enabled"), 0);
         }
         int cutout = program->uniform("cutout");
         int colour = program->uniform("material_colour");
