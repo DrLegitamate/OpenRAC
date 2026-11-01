@@ -221,6 +221,7 @@ pub fn view(data_home: &Path, game: &str, version: &str, bake: BakeStatus) -> En
             native: false,
             kind: "built-in".into(),
             path: String::new(),
+            missing: Vec::new(),
         },
         bake,
     }
