@@ -51,10 +51,14 @@ libraries and the Windows SDK, from any edition with the C++ tools, found
 with vswhere), with Clang (OPENRAC_CLANG, else LLVM's installer, Scoop or
 Visual Studio's own, else clang on PATH) and Ninja (PATH, or the one Visual
 Studio ships). On Linux and macOS, CMake, Ninja and Clang come from PATH, as
-the preset says. Standard library only.
+the preset says. A Linux computer without Ninja (SteamOS, whose system is
+read-only) is given Ninja's own release, pinned and checked against its
+SHA-256, in the user's cache (provide_ninja). Standard library only.
 """
 
 import argparse
+import hashlib
+import http.client
 import json
 import os
 import platform
@@ -64,8 +68,10 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
 from openrac_common import background, digest, paths, proc
@@ -91,6 +97,25 @@ NO_NINJA = (
     if WINDOWS
     else "Ninja was not found. Install it (apt install ninja-build, or brew install ninja), then build again."
 )
+
+# Ninja for a Linux computer that has none. SteamOS's system is read-only, and what pacman puts there
+# the next update takes away; a launcher's AppImage is read-only too, and mounted somewhere new at
+# each start, so a CMake cache naming a Ninja inside it would be stale by the next. Ninja's own
+# release is kept in the user's cache instead (XDG_CACHE_HOME, else ~/.cache), the archive and the
+# program in it both checked. Linked against glibc 2.17 and libstdc++ (GLIBCXX 3.4.21) only.
+NINJA_VERSION = "1.13.2"
+NINJA_URL = "https://github.com/ninja-build/ninja/releases/download/v{version}/{archive}"
+# platform.machine(), normalised -> the release's archive, its SHA-256, and the SHA-256 of its ninja.
+NINJA_RELEASES = {
+    "x86_64": ("ninja-linux.zip", "5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6",
+               "607e668f90dd6cd82e1a42ae572647ad1b1fd43063964295b9547836d8c15d99"),
+    "aarch64": ("ninja-linux-aarch64.zip", "fd2cacc8050a7f12a16a2e48f9e06fca5c14fc4c2bee2babb67b58be17a607fc",
+                "4394c776aa5031eea095055f50977479fbb0912080607bb1eff61f2d3af0e2f5"),
+}
+NINJA_MACHINES = {"amd64": "x86_64", "x64": "x86_64", "arm64": "aarch64"}
+# A download left behind by a build that was stopped, deleted after this long (another build may
+# still be writing a newer one).
+NINJA_STALE_SECONDS = 3600
 NO_CMAKE = "CMake 3.25 or newer was not found. Install it (https://cmake.org/download/), then build again."
 
 
@@ -485,7 +510,7 @@ def commands(
         for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_RC_COMPILER", "CMAKE_MAKE_PROGRAM",
                     "Python3_EXECUTABLE"):
             value = cache.get(key) or found.get(key)
-            if value:
+            if value and key not in wanted:
                 configure.append(f"-D{key}={value}")
         configure += [f"-D{key}={value}" for key, value in wanted.items()]
         out = [configure]
@@ -581,6 +606,113 @@ def find_cmake(cache: dict[str, str], *paths: str | None) -> Path:
     return found
 
 
+def ninja_folder(machine: str) -> Path:
+    """Where Ninja NINJA_VERSION for MACHINE is kept: under XDG_CACHE_HOME, else ~/.cache."""
+    base = os.environ.get("XDG_CACHE_HOME", "")
+    if not os.path.isabs(base):
+        try:
+            base = str(Path.home() / ".cache")
+        except RuntimeError as e:
+            raise BuildError(f"Ninja was not found, and there is no home folder to keep one in ({e}). "
+                             "Set XDG_CACHE_HOME to a writable folder, or put ninja on PATH, then build again.")
+    return Path(base) / "openrac" / "toolchains" / "ninja" / NINJA_VERSION / machine
+
+
+def ninja_runs(program: Path) -> str | None:
+    """Why PROGRAM does not run as Ninja, or None when it does."""
+    try:
+        done = subprocess.run([str(program), "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    return None if done.returncode == 0 else f"ninja --version exited with {done.returncode}"
+
+
+def provide_ninja(machine: str | None = None) -> Path:
+    """Ninja for a Linux computer whose PATH has none: the one kept in the user's cache when it is
+    whole, else NINJA_VERSION downloaded there and checked. Never written anywhere else, and never
+    left half-written: a download goes to a folder of its own and is moved in once checked."""
+    if not sys.platform.startswith("linux"):
+        raise BuildError(NO_NINJA)
+    machine = (machine or platform.machine()).lower()
+    machine = NINJA_MACHINES.get(machine, machine)
+    if machine not in NINJA_RELEASES:
+        raise BuildError(f"Ninja was not found, and Ninja's releases have no Linux program for this "
+                         f"processor ({machine}). Install Ninja, then build again.")
+    archive, archive_sha256, program_sha256 = NINJA_RELEASES[machine]
+    folder = ninja_folder(machine)
+    program = folder / "ninja"
+    fix = (f"Check the internet connection, or that {folder} can be written, and build again; or put a "
+           "ninja program on PATH.")
+    try:
+        if program.is_file() and digest.sha256(program) == program_sha256:
+            if not os.access(program, os.X_OK):
+                program.chmod(0o755)
+            why = ninja_runs(program)
+            if why is None:
+                return program
+            raise BuildError(f"the Ninja in {folder} does not run: {why}")
+        url = NINJA_URL.format(version=NINJA_VERSION, archive=archive)
+        say(f"Ninja was not found: downloading Ninja {NINJA_VERSION} into {folder} ({url})")
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in folder.glob(".download-*"):
+            if time.time() - old.stat().st_mtime > NINJA_STALE_SECONDS:
+                shutil.rmtree(old, ignore_errors=True)
+        with tempfile.TemporaryDirectory(dir=folder, prefix=".download-") as tmp:
+            part = Path(tmp) / archive
+            with urllib.request.urlopen(url, timeout=120) as response, part.open("wb") as out:
+                shutil.copyfileobj(response, out)
+            got = digest.sha256(part)
+            if got != archive_sha256:
+                raise BuildError(f"Ninja's download ({archive}) has SHA-256 {got}, not {archive_sha256}: it was "
+                                 f"not used. {fix}")
+            with zipfile.ZipFile(part) as zipped:
+                data = zipped.read("ninja")
+            got = hashlib.sha256(data).hexdigest()
+            if got != program_sha256:
+                raise BuildError(f"the ninja in Ninja's download has SHA-256 {got}, not {program_sha256}: it was "
+                                 f"not used. {fix}")
+            staged = Path(tmp) / "ninja"
+            staged.write_bytes(data)
+            staged.chmod(0o755)
+            why = ninja_runs(staged)
+            if why is not None:
+                raise BuildError(f"Ninja {NINJA_VERSION} was downloaded but does not run here: {why}")
+            os.replace(staged, program)
+    except (OSError, http.client.HTTPException, zipfile.BadZipFile, KeyError) as e:
+        raise BuildError(f"Ninja was not found, and Ninja {NINJA_VERSION} could not be set up in {folder}: {e}. "
+                         f"{fix}") from e
+    say(f"Ninja {NINJA_VERSION}: {program}")
+    return program
+
+
+def unix_ninja(cache: dict[str, str], user_path: str | None) -> Path | None:
+    """The folder of a Ninja that the build needs on PATH, or None: PATH's own Ninja first, else the
+    cached one the folder was configured with, else provide_ninja's (when the folder has none that
+    still exists, or was never configured)."""
+    if find_program("ninja", user_path) is not None:
+        return None
+    cached = cache.get("CMAKE_MAKE_PROGRAM")
+    if cached and Path(cached).is_file():
+        return Path(cached).parent
+    return provide_ninja().parent
+
+
+def gone_programs(cache: dict[str, str], env: dict[str, str], python: str) -> dict[str, str]:
+    """The cache's programs that are no longer there, and what to configure with instead: Ninja from
+    ENV's PATH, and this Python. A launcher's AppImage is mounted somewhere new at each start, so a
+    folder configured from one names a Python, and could name a Ninja, that is gone."""
+    out = {}
+    make = cache.get("CMAKE_MAKE_PROGRAM")
+    if make and not Path(make).is_file():
+        ninja = find_program("ninja", env.get("PATH"))
+        if ninja is not None:
+            out["CMAKE_MAKE_PROGRAM"] = ninja.as_posix()
+    cached_python = cache.get("Python3_EXECUTABLE")
+    if cached_python and not Path(cached_python).is_file():
+        out["Python3_EXECUTABLE"] = python
+    return out
+
+
 # ---- the build ---------------------------------------------------------------------------
 
 
@@ -588,12 +720,15 @@ def prepare(cache: dict[str, str]) -> tuple[dict[str, str], Path, tuple[str, str
     """The environment to build in, CMake, and the compilers to configure a new folder with."""
     user_path = os.environ.get("PATH")
     if not WINDOWS:
+        env = dict(os.environ)
+        ninja = unix_ninja(cache, user_path)
+        if ninja is not None:
+            # For CMake's generator check and for every build it starts (Embree's, FetchContent's).
+            env["PATH"] = os.pathsep.join(part for part in (str(ninja), user_path) if part)
         if not cache:
-            if find_program("ninja", user_path) is None:
-                raise BuildError(NO_NINJA)
             if find_program("clang", user_path) is None:
                 raise BuildError(NO_CLANG)
-        return dict(os.environ), find_cmake(cache, user_path), None
+        return env, find_cmake(cache, user_path), None
 
     visual_studio = find_visual_studio()
     say(f"Visual Studio: {visual_studio}")
@@ -687,6 +822,9 @@ def main(argv: list[str] | None = None) -> int:
     python = plain_path(sys.executable).as_posix()
     more = list(args.target)
     defines: dict[str, str] = {}
+    # Programs the folder was configured with that are gone (an AppImage's earlier mount): new ones.
+    gone = {} if WINDOWS else gone_programs(cache, env, python)
+    cache = {key: value for key, value in cache.items() if key not in gone}
     if args.probe_baker or cache.get("OPENRAC_PROBE_BAKER") == "ON" or kept.get("OPENRAC_PROBE_BAKER") == "ON":
         defines, baker = probe_baker(str(cmake), env, compilers, cache)
         more += baker
@@ -696,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
         "OPENRAC_TRACY_SYSTEM": "ON" if args.tracy_system or args.tracy_sampling else "OFF",
         "OPENRAC_TRACY_SAMPLING": "ON" if args.tracy_sampling else "OFF",
     })
+    defines.update(gone)
     for command in commands(str(cmake), args.preset, build, names, source, cache, compilers, python, more,
                             disc, kept, defines):
         say("> " + " ".join(f'"{part}"' if " " in part else part for part in command))

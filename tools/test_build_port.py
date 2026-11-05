@@ -2,9 +2,14 @@
 python3 -m unittest discover -s tools"""
 
 import contextlib
+import hashlib
+import http.client
 import os
 import io
+import sys
 import tempfile
+import time
+import zipfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -365,6 +370,367 @@ class CommandLine(unittest.TestCase):
     def test_a_disc_for_two_games_or_none_is_refused(self):
         self.refused(["rac1-pal", "rac1-ntsc", "--disc", __file__])
         self.refused(["rac1-pal", "--disc", "/no/such/disc.iso"])
+
+
+# The real pins, before a test replaces them with a fake archive's.
+PINNED_NINJA = dict(build_port.NINJA_RELEASES)
+FAKE_NINJA = b"\x7fELF not really ninja"
+
+
+def ninja_zip(program: bytes = FAKE_NINJA) -> bytes:
+    """A release archive as Ninja's: one file, ninja."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as zipped:
+        zipped.writestr("ninja", program)
+    return out.getvalue()
+
+
+class Response(io.BytesIO):
+    """What urlopen returns, as a context manager; FAIL_AFTER bytes in, the connection drops."""
+
+    def __init__(self, data: bytes, fail_after: int | None = None):
+        super().__init__(data)
+        self.fail_after = fail_after
+
+    def read(self, size=-1):
+        if self.fail_after is not None and self.tell() >= self.fail_after:
+            raise http.client.IncompleteRead(b"", 1)
+        if self.fail_after is not None and size < 0:
+            size = self.fail_after - self.tell()
+        return super().read(size)
+
+
+class ProvideNinja(unittest.TestCase):
+    """Ninja for a Linux computer without one (SteamOS): never the network for real."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cache = self.root / "cache"
+        self.archive = ninja_zip()
+        self.releases = {"x86_64": ("ninja-linux.zip", hashlib.sha256(self.archive).hexdigest(),
+                                    hashlib.sha256(FAKE_NINJA).hexdigest()),
+                         "aarch64": ("ninja-linux-aarch64.zip", "0" * 64, "0" * 64)}
+        for patch in (mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.cache)}),
+                      mock.patch.object(build_port, "NINJA_RELEASES", self.releases),
+                      mock.patch.object(build_port.sys, "platform", "linux"),
+                      mock.patch.object(build_port, "ninja_runs", return_value=None),
+                      contextlib.redirect_stdout(io.StringIO())):
+            patch.__enter__()
+            self.addCleanup(patch.__exit__, None, None, None)
+        self.folder = self.cache / "openrac" / "toolchains" / "ninja" / build_port.NINJA_VERSION / "x86_64"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def download(self, *responses):
+        return mock.patch.object(build_port.urllib.request, "urlopen", side_effect=list(responses))
+
+    def leftovers(self):
+        return list(self.folder.glob(".download-*")) if self.folder.exists() else []
+
+    def test_the_pinned_release_is_official_and_checked(self):
+        self.assertEqual(build_port.NINJA_URL.format(version="1.13.2", archive="ninja-linux.zip"),
+                         "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip")
+        self.assertEqual(set(PINNED_NINJA), {"x86_64", "aarch64"})
+        for machine, (archive, archive_sha, program_sha) in PINNED_NINJA.items():
+            self.assertTrue(archive.startswith("ninja-linux"), machine)
+            self.assertRegex(archive_sha, "^[0-9a-f]{64}$")
+            self.assertRegex(program_sha, "^[0-9a-f]{64}$")
+
+    def test_a_missing_ninja_is_downloaded_into_the_users_cache(self):
+        with self.download(Response(self.archive)) as urlopen:
+            program = build_port.provide_ninja("x86_64")
+        self.assertEqual(program, self.folder / "ninja")
+        self.assertEqual(program.read_bytes(), FAKE_NINJA)
+        self.assertTrue(os.access(program, os.X_OK))
+        self.assertIn("/v1.13.2/ninja-linux.zip", urlopen.call_args.args[0])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_whole_cached_ninja_is_used_again_without_the_network(self):
+        with self.download(Response(self.archive)):
+            build_port.provide_ninja("x86_64")
+        (self.folder / "ninja").chmod(0o644)  # a copy that lost its executable bit is given it back
+        with self.download() as urlopen:
+            program = build_port.provide_ninja("x86_64")
+        urlopen.assert_not_called()
+        self.assertTrue(os.access(program, os.X_OK))
+
+    def test_a_corrupted_cached_ninja_is_downloaded_again(self):
+        self.folder.mkdir(parents=True)
+        (self.folder / "ninja").write_bytes(b"half a ninja")
+        with self.download(Response(self.archive)) as urlopen:
+            program = build_port.provide_ninja("x86_64")
+        urlopen.assert_called_once()
+        self.assertEqual(program.read_bytes(), FAKE_NINJA)
+
+    def test_an_archive_with_another_checksum_is_not_used(self):
+        with self.download(Response(ninja_zip(b"something else"))), self.assertRaises(build_port.BuildError) as e:
+            build_port.provide_ninja("x86_64")
+        self.assertIn("SHA-256", str(e.exception))
+        self.assertIn("internet connection", str(e.exception))
+        self.assertFalse((self.folder / "ninja").exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_program_with_another_checksum_is_not_used(self):
+        other = ninja_zip(b"something else")
+        self.releases["x86_64"] = ("ninja-linux.zip", hashlib.sha256(other).hexdigest(), "0" * 64)
+        with self.download(Response(other)), self.assertRaises(build_port.BuildError):
+            build_port.provide_ninja("x86_64")
+        self.assertFalse((self.folder / "ninja").exists())
+
+    def test_an_interrupted_download_leaves_nothing_and_says_so(self):
+        for response in (Response(self.archive, fail_after=100),
+                         ConnectionResetError("connection reset"),
+                         build_port.urllib.error.URLError("no network")):
+            with self.subTest(response=response), self.download(response), \
+                    self.assertRaises(build_port.BuildError) as e:
+                build_port.provide_ninja("x86_64")
+            self.assertIn("could not be set up", str(e.exception))
+            self.assertFalse((self.folder / "ninja").exists())
+            self.assertEqual(self.leftovers(), [])
+
+    def test_a_download_a_stopped_build_left_is_cleared_later(self):
+        stale = self.folder / ".download-old"
+        fresh = self.folder / ".download-new"
+        for folder in (stale, fresh):
+            folder.mkdir(parents=True)
+            (folder / "ninja-linux.zip").write_bytes(b"half")
+        old = time.time() - build_port.NINJA_STALE_SECONDS - 10
+        os.utime(stale, (old, old))
+        with self.download(Response(self.archive)):
+            build_port.provide_ninja("x86_64")
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())  # perhaps another build's, still downloading
+
+    def test_another_processor_is_refused_without_the_network(self):
+        with self.download() as urlopen, self.assertRaises(build_port.BuildError) as e:
+            build_port.provide_ninja("riscv64")
+        urlopen.assert_not_called()
+        self.assertIn("riscv64", str(e.exception))
+
+    def test_the_processors_other_names_are_understood(self):
+        with self.download(Response(self.archive)):
+            self.assertEqual(build_port.provide_ninja("AMD64").parent.name, "x86_64")
+        with self.download(Response(self.archive)) as urlopen, self.assertRaises(build_port.BuildError):
+            build_port.provide_ninja("arm64")  # aarch64's download, whose pin the fake does not match
+        urlopen.assert_called_once()
+        self.assertIn("ninja-linux-aarch64.zip", urlopen.call_args.args[0])
+
+    def test_macos_and_windows_are_told_to_install_it_as_before(self):
+        for system in ("darwin", "win32"):
+            with self.subTest(system=system), mock.patch.object(build_port.sys, "platform", system), \
+                    self.download() as urlopen, self.assertRaises(build_port.BuildError) as e:
+                build_port.provide_ninja("x86_64")
+            urlopen.assert_not_called()
+            self.assertEqual(str(e.exception), build_port.NO_NINJA)
+
+    def test_the_read_only_appimage_is_never_written(self):
+        appimage = self.root / ".mount_OpenRAC" / "usr" / "lib" / "OpenRAC Launcher" / "openrac"
+        (appimage / "python" / "bin").mkdir(parents=True)
+        (appimage / "python" / "bin" / "python3").write_bytes(b"")
+        before = sorted(p.relative_to(appimage) for p in appimage.rglob("*"))
+        appimage.chmod(0o555)
+        try:
+            with mock.patch.object(build_port.sys, "executable", str(appimage / "python" / "bin" / "python3")), \
+                    mock.patch.object(build_port, "ROOT", appimage), self.download(Response(self.archive)):
+                program = build_port.provide_ninja("x86_64")
+        finally:
+            appimage.chmod(0o755)
+        self.assertEqual(sorted(p.relative_to(appimage) for p in appimage.rglob("*")), before)
+        self.assertTrue(program.is_relative_to(self.cache))
+
+    def test_a_cache_that_cannot_be_written_says_what_to_do(self):
+        blocked = self.root / "not-a-folder"
+        blocked.write_text("")
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(blocked)}), self.download() as urlopen, \
+                self.assertRaises(build_port.BuildError) as e:
+            build_port.provide_ninja("x86_64")
+        urlopen.assert_not_called()
+        self.assertIn(str(blocked), str(e.exception))
+        self.assertIn("ninja program on PATH", str(e.exception))
+
+    def test_without_a_home_folder_it_says_what_to_do(self):
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": ""}), \
+                mock.patch.object(build_port.Path, "home", side_effect=RuntimeError("no home")), \
+                self.assertRaises(build_port.BuildError) as e:
+            build_port.provide_ninja("x86_64")
+        self.assertIn("XDG_CACHE_HOME", str(e.exception))
+
+    def test_a_relative_xdg_cache_home_is_ignored(self):
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "relative"}), \
+                mock.patch.object(build_port.Path, "home", return_value=self.root / "home"):
+            self.assertEqual(build_port.ninja_folder("x86_64"),
+                             self.root / "home" / ".cache" / "openrac" / "toolchains" / "ninja"
+                             / build_port.NINJA_VERSION / "x86_64")
+
+    def test_a_cached_ninja_that_does_not_run_is_reported(self):
+        self.folder.mkdir(parents=True)
+        (self.folder / "ninja").write_bytes(FAKE_NINJA)
+        with mock.patch.object(build_port, "ninja_runs", return_value="Exec format error"), \
+                self.assertRaises(build_port.BuildError) as e:
+            build_port.provide_ninja("x86_64")
+        self.assertIn("Exec format error", str(e.exception))
+
+
+class NinjaOnPath(unittest.TestCase):
+    """Which Ninja a build on Linux or macOS runs with, and that every command it starts sees it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.system = self.root / "usr-bin"
+        self.system.mkdir()
+        self.provided = self.root / "cache" / "ninja"
+        self.provided.mkdir(parents=True)
+        (self.provided / "ninja").write_bytes(b"")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def found(self, ninja_on_path: bool):
+        def find(name, *paths):
+            if name == "ninja":
+                return self.system / "ninja" if ninja_on_path and str(self.system) in paths else None
+            return Path(f"/usr/bin/{name}")
+        return mock.patch.object(build_port, "find_program", side_effect=find)
+
+    def prepare(self, cache, ninja_on_path):
+        with mock.patch.object(build_port, "WINDOWS", False), \
+                mock.patch.dict(os.environ, {"PATH": str(self.system)}), self.found(ninja_on_path), \
+                mock.patch.object(build_port, "find_cmake", return_value=Path("/usr/bin/cmake")), \
+                mock.patch.object(build_port, "provide_ninja", return_value=self.provided / "ninja") as provide:
+            env, _, compilers = build_port.prepare(cache)
+        return env, compilers, provide
+
+    def test_the_systems_ninja_is_used_without_a_download(self):
+        env, compilers, provide = self.prepare({}, ninja_on_path=True)
+        provide.assert_not_called()
+        self.assertEqual(env["PATH"], str(self.system))
+        self.assertIsNone(compilers)
+
+    def test_a_new_folder_without_ninja_on_path_gets_the_provided_one_first_on_path(self):
+        env, _, provide = self.prepare({}, ninja_on_path=False)
+        provide.assert_called_once()
+        self.assertEqual(env["PATH"].split(os.pathsep), [str(self.provided), str(self.system)])
+
+    def test_a_folder_configured_with_the_provided_ninja_finds_it_without_a_download(self):
+        cache = {"CMAKE_MAKE_PROGRAM": (self.provided / "ninja").as_posix()}
+        env, _, provide = self.prepare(cache, ninja_on_path=False)
+        provide.assert_not_called()
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], str(self.provided))
+
+    def test_a_folder_whose_ninja_is_gone_gets_one_again(self):
+        env, _, provide = self.prepare({"CMAKE_MAKE_PROGRAM": "/tmp/.mount_old/ninja"}, ninja_on_path=False)
+        provide.assert_called_once()
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], str(self.provided))
+
+    def test_every_command_runs_with_the_provided_ninja_on_path(self):
+        env = {"PATH": os.pathsep.join([str(self.provided), "/usr/bin"])}
+        with mock.patch.object(build_port, "WINDOWS", False), \
+                mock.patch.object(build_port, "read_cache", return_value={}), \
+                mock.patch.object(build_port, "prepare", return_value=(env, Path("cmake"), None)), \
+                mock.patch.object(build_port, "write_stamp"), \
+                mock.patch.object(build_port.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(build_port.main(["rac1-pal"]), 0)
+        self.assertEqual(len(run.call_args_list), 2)  # configure, build
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"]["PATH"].split(os.pathsep)[0], str(self.provided))
+
+    def test_a_failure_to_provide_ninja_stops_the_build_with_its_reason(self):
+        err = io.StringIO()
+        with mock.patch.object(build_port, "read_cache", return_value={}), \
+                mock.patch.object(build_port, "prepare", side_effect=build_port.BuildError("no network: why")), \
+                mock.patch.object(build_port.subprocess, "run") as run, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(build_port.main(["rac1-pal"]), 1)
+        run.assert_not_called()
+        self.assertIn("error: no network: why", err.getvalue())
+
+
+class GonePrograms(unittest.TestCase):
+    """A folder configured from an earlier AppImage mount names programs that are gone."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ninja = self.root / "ninja"
+        self.ninja.write_bytes(b"")
+        self.python = self.root / "python3"
+        self.python.write_bytes(b"")
+        self.build = self.root / "build" / "release"
+        self.build.mkdir(parents=True)
+        (self.build / "build.ninja").write_text("")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_programs_still_there_are_kept(self):
+        cache = {"CMAKE_MAKE_PROGRAM": self.ninja.as_posix(), "Python3_EXECUTABLE": self.python.as_posix()}
+        self.assertEqual(build_port.gone_programs(cache, {"PATH": str(self.root)}, "/new/python3"), {})
+
+    def test_gone_programs_are_replaced(self):
+        cache = {"CMAKE_MAKE_PROGRAM": "/tmp/.mount_old/ninja", "Python3_EXECUTABLE": "/tmp/.mount_old/python3"}
+        with mock.patch.object(build_port, "find_program", return_value=self.ninja):
+            gone = build_port.gone_programs(cache, {"PATH": str(self.root)}, "/tmp/.mount_new/python3")
+        self.assertEqual(gone, {"CMAKE_MAKE_PROGRAM": self.ninja.as_posix(),
+                                "Python3_EXECUTABLE": "/tmp/.mount_new/python3"})
+
+    def run_main(self, cache, windows=False):
+        env = {"PATH": str(self.root)}
+        with mock.patch.object(build_port, "WINDOWS", windows), \
+                mock.patch.object(build_port, "PORT", self.root), \
+                mock.patch.object(build_port, "ROOT", self.root), \
+                mock.patch.object(build_port, "read_cache", return_value=cache), \
+                mock.patch.object(build_port, "prepare", return_value=(env, Path("cmake"), None)), \
+                mock.patch.object(build_port, "find_program", return_value=self.ninja), \
+                mock.patch.object(build_port, "write_stamp"), \
+                mock.patch.object(build_port.sys, "executable", "/tmp/.mount_new/python3"), \
+                mock.patch.object(build_port.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(build_port, "games", return_value=["rac1-pal"]), \
+                    mock.patch.object(build_port, "default_source", return_value=self.root):
+                self.assertEqual(build_port.main(["rac1-pal"]), 0)
+        return [call.args[0] for call in run.call_args_list]
+
+    def test_a_configured_folder_is_configured_again_with_the_new_programs(self):
+        cache = {"CMAKE_MAKE_PROGRAM": "/tmp/.mount_old/ninja", "Python3_EXECUTABLE": "/tmp/.mount_old/python3",
+                 "OPENRAC_TRACY": "OFF", "OPENRAC_TRACY_SYSTEM": "OFF", "OPENRAC_TRACY_SAMPLING": "OFF"}
+        configure = self.run_main(cache)[0]
+        self.assertEqual(configure[:5], ["cmake", "-S", str(self.root), "-B", str(self.root / "build" / "release")])
+        self.assertIn(f"-DCMAKE_MAKE_PROGRAM={self.ninja.as_posix()}", configure)
+        self.assertIn("-DPython3_EXECUTABLE=/tmp/.mount_new/python3", configure)
+
+    def test_windows_keeps_its_folders_programs_as_before(self):
+        cache = {"CMAKE_MAKE_PROGRAM": "C:/gone/ninja.exe", "OPENRAC_TRACY": "OFF",
+                 "OPENRAC_TRACY_SYSTEM": "OFF", "OPENRAC_TRACY_SAMPLING": "OFF"}
+        commands = self.run_main(cache, windows=True)
+        self.assertEqual(len(commands), 1)  # only built, as before
+        self.assertNotIn("-DCMAKE_MAKE_PROGRAM", " ".join(commands[0]))
+
+    def test_a_new_folder_names_the_new_python_once(self):
+        cache = {"Python3_EXECUTABLE": "/tmp/.mount_old/python3"}
+        (self.build / "build.ninja").unlink()
+        configure = self.run_main(cache)[0]
+        self.assertEqual(configure[:3], ["cmake", "--preset", "release"])
+        self.assertEqual([p for p in configure if p.startswith("-DPython3_EXECUTABLE=")],
+                         ["-DPython3_EXECUTABLE=/tmp/.mount_new/python3"])
+
+
+class WindowsNinja(unittest.TestCase):
+    def test_windows_still_asks_for_ninja_and_downloads_nothing(self):
+        with mock.patch.object(build_port, "WINDOWS", True), \
+                mock.patch.object(build_port, "find_visual_studio", return_value=Path("X:/VS")), \
+                mock.patch.object(build_port, "msvc_environment", return_value={"PATH": ""}), \
+                mock.patch.object(build_port, "find_clang",
+                                  return_value=(Path("X:/clang.exe"), Path("X:/clang++.exe"))), \
+                mock.patch.object(build_port, "find_program", return_value=None), \
+                mock.patch.object(build_port, "provide_ninja") as provide, \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(build_port.BuildError) as e:
+            build_port.prepare({})
+        provide.assert_not_called()
+        self.assertEqual(str(e.exception), build_port.NO_NINJA)
 
 
 if __name__ == "__main__":
