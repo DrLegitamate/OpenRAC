@@ -308,6 +308,24 @@ function(openrac_add_game config)
       # (tools/asm_part.py exports).
       if(WIN32 AND EXISTS "${config_dir}/asm_part_exports.def")
         target_sources(${target} PRIVATE "${config_dir}/asm_part_exports.def")
+      elseif(UNIX AND NOT APPLE AND NOT ANDROID AND EXISTS "${config_dir}/asm_part_exports.def")
+        # On Linux the program exports what it has (ENABLE_EXPORTS), but it has only what it links:
+        # each name the part calls is asked of the linker, so the object of the game's library that
+        # defines it is linked even where the program itself never calls it. A response file of
+        # -u options, which every linker reads (lld has no --require-defined): a name the program
+        # no longer has stops the part's loading instead (asm_part.cpp), with the name.
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${config_dir}/asm_part_exports.def")
+        file(STRINGS "${config_dir}/asm_part_exports.def" asm_exports REGEX "^[ \t]+[A-Za-z_]")
+        set(asm_required "")
+        foreach(line IN LISTS asm_exports)
+          string(STRIP "${line}" line)
+          string(REGEX REPLACE "[ \t]+DATA$" "" line "${line}")
+          string(APPEND asm_required "-Wl,--undefined=${line}\n")
+        endforeach()
+        set(asm_rsp "${CMAKE_BINARY_DIR}/generated/openrac_${target_id}_asm_part.rsp")
+        file(CONFIGURE OUTPUT "${asm_rsp}" CONTENT "${asm_required}")
+        target_link_options(${target} PRIVATE "@${asm_rsp}")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${asm_rsp}")
       endif()
     endif()
     target_link_libraries(${target} PRIVATE openrac_${target_id}_game openrac_runtime openrac_mods)

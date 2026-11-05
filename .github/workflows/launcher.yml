@@ -326,10 +326,11 @@ jobs:
       - name: Build the game
         if: matrix.name != 'android'
         run: |
-          # Windows also carries Going Commando built without the disc, as the APK does: the player's
-          # computer builds what is missing with the Zig it carries (the next step, tools/asm_part.py).
+          # Windows and Linux also carry Going Commando built without the disc, as the APK does: the
+          # player's computer builds what is missing with the Zig it carries (the next steps,
+          # tools/asm_part.py). SteamOS has no compiler and no headers for a build of its own.
           games="rac1-pal rac1-ntsc"
-          if [ "$NAME" = windows ]; then games="$games rac2-ntsc"; fi
+          if [ "$NAME" != macos ]; then games="$games rac2-ntsc"; fi
           python tools/build_port.py $games --preset standalone --probe-baker || {
             echo "::warning::building again with a fresh configuration"
             rm -rf port/build/standalone/CMakeCache.txt port/build/standalone/CMakeFiles
@@ -358,6 +359,30 @@ jobs:
           OPENRAC_PART_ZIG="$RUNNER_TEMP/zig/$name/zig.exe" python tools/asm_part.py check rac2-ntsc \
             --kit "$RUNNER_TEMP/kit" --out "$RUNNER_TEMP/kit-check"
 
+      # Zig's own Linux release for this processor, the one the APK carries for Android
+      # (tools/build_android.py ZIG_VERSION, ZIG_FILES): its Clang and lld build the part on the
+      # player's computer, and its glibc and Linux headers go into the kit.
+      - name: Zig and the kit for Going Commando's part (Linux)
+        if: matrix.name == 'linux' || matrix.name == 'linux-arm64' || matrix.name == 'fedora'
+        env:
+          ZIG_VERSION: "0.14.1"
+        run: |
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64) sha=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c ;;
+            aarch64) sha=f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b ;;
+            *) echo "no Zig for $arch"; exit 1 ;;
+          esac
+          name="zig-$arch-linux-$ZIG_VERSION"
+          curl -sSfL --retry 5 -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$name.tar.xz"
+          echo "$sha  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "PART_ZIG=$RUNNER_TEMP/zig/$name" >> "$GITHUB_ENV"
+          python tools/asm_part.py kit rac2-ntsc --build port/build/standalone --out "$RUNNER_TEMP/kit" \
+            --linux-zig "$RUNNER_TEMP/zig/$name"
+          OPENRAC_PART_ZIG="$RUNNER_TEMP/zig/$name/zig" python tools/asm_part.py check rac2-ntsc \
+            --kit "$RUNNER_TEMP/kit" --out "$RUNNER_TEMP/kit-check"
+
       - name: A Python for the tools
         if: matrix.name != 'android'
         run: |
@@ -376,7 +401,7 @@ jobs:
         if: matrix.name != 'android'
         run: |
           part=()
-          if [ "$NAME" = windows ]; then part=(--asm-part-kit "$RUNNER_TEMP/kit" --part-zig "$PART_ZIG"); fi
+          if [ -n "${PART_ZIG:-}" ]; then part=(--asm-part-kit "$RUNNER_TEMP/kit" --part-zig "$PART_ZIG"); fi
           python tools/bundle_standalone.py "$COPY" --game-build port/build/standalone \
             --python "$RUNNER_TEMP/python/python" "${part[@]}"
           # Its own Python runs its own tools, and the game starts far enough to say what it is.
@@ -411,6 +436,14 @@ jobs:
             for dll in msvcp140.dll msvcp140_2.dll vcruntime140.dll vcruntime140_1.dll; do
               [ -f "$COPY/port/build/release/$dll" ] || { echo "the copy carries no $dll"; exit 1; }
             done
+          fi
+          # On Linux Going Commando is carried too, with what builds its part from the player's disc:
+          # the copy's own tools run the kit's check with the copy's own Zig (tools/part-zig/zig).
+          if [ -n "${PART_ZIG:-}" ] && [ "$NAME" != windows ]; then
+            "$COPY/port/build/release/openrac-rac2-ntsc" --help || true
+            [ -x "$COPY/tools/part-zig/zig" ] || { echo "the copy carries no tools/part-zig/zig"; exit 1; }
+            "$py" "$COPY/tools/asm_part.py" check rac2-ntsc --kit "$COPY/port/asm-part/rac2-ntsc" \
+              --out "$RUNNER_TEMP/copy-check"
           fi
           # On macOS each game carries MoltenVK, for the Vulkan renderer (port/cmake/MacApp.cmake).
           if [ "$NAME" = macos ]; then

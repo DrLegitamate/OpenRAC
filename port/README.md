@@ -27,8 +27,10 @@ read the decompilation) and Python 3.
   OpenRAC, builds one game without the steps above. The launcher's "Build the
   game" runs it. It configures `build/release` once, then builds only what
   changed. On Windows it sets up Visual Studio's x64 environment and finds
-  Clang and Ninja. `--source` builds from your own copy of the decompilation
-  and is remembered.
+  Clang and Ninja. On Linux without Ninja (SteamOS, say) it downloads Ninja's
+  own pinned release, checked against its SHA-256, into
+  `~/.cache/openrac/toolchains/ninja`. `--source` builds from your own copy of
+  the decompilation and is remembered.
 
 ## Enhanced rendering
 

@@ -3,28 +3,33 @@
 The part of a game built from the player's disc (port/tools/hostgen/asmext.py), where the player
 is: the functions the decompilation has only in assembly, translated from the disc's own programs
 (port/tools/hostgen/asmdev.py) and compiled into a library the game loads before it starts
-(port/game/common/program/asm_part.cpp). An Android or a Windows launcher does it with the Python,
-Clang and lld it carries; nothing of the disc is in the launcher.
+(port/game/common/program/asm_part.cpp). An Android, a Windows or a Linux launcher does it with the
+Python, Clang and lld it carries; nothing of the disc is in the launcher.
 
   python3 tools/asm_part.py kit GAME --build DIR --out KIT [--sysroot SYSROOT --resource-dir DIR]
-                                                           [--windows-zig ZIG]
+                                                           [--windows-zig ZIG | --linux-zig ZIG]
   python3 tools/asm_part.py build GAME --disc IMAGE --out DIR [--kit KIT]
   python3 tools/asm_part.py check GAME --kit KIT --out DIR
   python3 tools/asm_part.py exports GAME --disc IMAGE --kit KIT --out DIR
 
-kit (the launcher's build: tools/build_android.py, or CI's on Windows): what building the part needs besides the disc, in
-KIT: hostgen's program before its assembly stage (DIR/games/GAME/gen/program.pickle, which a build
-without the disc writes), the game's hostgen.json and interface, and every header the translations
-include, copied from where the build compiled them, the system's (SYSROOT, Clang's RESOURCE-DIR)
-among them. --windows-zig names an unpacked Zig for Windows: the system's headers are the free ones
-it carries (mingw-w64's and Clang's), so nothing of Microsoft's is in the kit.
+kit (the launcher's build: tools/build_android.py, or CI's on Windows and Linux): what building the
+part needs besides the disc, in KIT: hostgen's program before its assembly stage
+(DIR/games/GAME/gen/program.pickle, which a build without the disc writes), the game's hostgen.json
+and interface, and every header the translations include, copied from where the build compiled
+them, the system's (SYSROOT, Clang's RESOURCE-DIR) among them. --windows-zig names an unpacked Zig
+for Windows: the system's headers are the free ones it carries (mingw-w64's and Clang's), so nothing
+of Microsoft's is in the kit. --linux-zig names an unpacked Zig for Linux on this processor: the kit
+carries its glibc and Linux headers, and Clang's, so the player's system needs none (SteamOS has no
+compiler and no headers).
 
 build (the launcher's, once the disc is set up): DIR/libopenrac-GAME-part.so (.dll on Windows),
 where the game looks for it (<data>/asm-part). Clang and lld are the APK's Zig
-(OPENRAC_NATIVE_LIBRARY_DIR: libopenrac-zig.so), the installer's (tools/part-zig/zig.exe) or
-OPENRAC_PART_ZIG, else OPENRAC_PART_CLANG and OPENRAC_PART_LLD, else clang and ld.lld on PATH; the
-game's library is linked against so the part finds its functions. A Windows program is not linked
-against: the kit's asm_part_exports.def says what it exports, and the import library is made here.
+(OPENRAC_NATIVE_LIBRARY_DIR: libopenrac-zig.so), the installer's (tools/part-zig/zig.exe, or
+tools/part-zig/zig on Linux) or OPENRAC_PART_ZIG, else OPENRAC_PART_CLANG and OPENRAC_PART_LLD, else
+clang and ld.lld on PATH; on Android the game's library is linked against so the part finds its
+functions. A Windows program is not linked against: the kit's asm_part_exports.def says what it
+exports, and the import library is made here. A Linux program exports them itself
+(cmake/Games.cmake), and the part's names are bound to it when the game loads the part.
 
 check (the launcher's build): a file that includes what the translations do, built with KIT as the
 part is.
@@ -38,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import struct
 import subprocess
@@ -58,11 +64,17 @@ C_FLAGS = ["-O2", "-DNDEBUG", "-std=gnu11", "-fno-strict-aliasing", "-fwrapv", "
            "-DOPENRAC_ASM_PART=1"]
 ANDROID_TARGET = "aarch64-linux-android29"
 WINDOWS_TARGET = "x86_64-windows-gnu"
+# A Linux part's glibc: the oldest the carried games run on (.github/workflows/launcher.yml), as
+# Zig's headers are told it (they take __GLIBC_MINOR__ from the command line).
+LINUX_GLIBC_MINOR = 35
+# platform.machine() -> Zig's name for the processor's glibc headers, and its family's Linux ones.
+LINUX_ARCHES = {"x86_64": ("x86_64", "x86"), "amd64": ("x86_64", "x86"),
+                "aarch64": ("aarch64", "aarch64"), "arm64": ("aarch64", "aarch64")}
 KIT_FORMAT = 1
 # Zig (Clang and lld in one program) as the APK carries it (tools/build_android.py PART_TOOL).
 ZIG_LIBRARY = "libopenrac-zig.so"
-# And as a Windows installer carries it (tools/bundle_standalone.py).
-ZIG_PROGRAM = ROOT / "tools" / "part-zig" / "zig.exe"
+# And as a Windows or Linux installer carries it (tools/bundle_standalone.py).
+ZIG_PROGRAM = ROOT / "tools" / "part-zig" / ("zig.exe" if os.name == "nt" else "zig")
 # What the Windows program exports for the part (tools/asm_part.py exports), beside its hostgen.json.
 EXPORTS = "asm_part_exports.def"
 # The scale of the count the build prints.
@@ -73,8 +85,24 @@ def part_name(game: str, windows: bool = False) -> str:
     return f"libopenrac-{game}-part.{'dll' if windows else 'so'}"
 
 
+def linux_target(machine: str | None = None) -> tuple[str, list[str]]:
+    """The triple a Linux part is compiled for on MACHINE (platform.machine(), this one's unless
+    given), and the folders of an unpacked Zig's lib that hold its headers, in Zig's own order."""
+    machine = (machine or platform.machine()).lower()
+    if machine not in LINUX_ARCHES:
+        sys.exit(f"no Linux part for this processor ({machine})")
+    arch, family = LINUX_ARCHES[machine]
+    return f"{arch}-linux-gnu", ["include", f"libc/include/{arch}-linux-gnu", "libc/include/generic-glibc",
+                                 f"libc/include/{family}-linux-any", "libc/include/any-linux-any"]
+
+
+def linux_flags(meta: dict) -> list[str]:
+    """What a Linux kit's part is compiled with besides the kit's headers."""
+    return [f"--target={meta['triple']}", "-nostdinc", f"-D__GLIBC_MINOR__={meta['glibc_minor']}"]
+
+
 def kit(game: str, build: Path, out: Path, sysroot: Path | None, resource_dir: Path | None,
-        windows_zig: Path | None = None) -> None:
+        windows_zig: Path | None = None, linux_zig: Path | None = None) -> None:
     gen = build / "games" / game / "gen"
     if not (gen / "program.pickle").is_file():
         sys.exit(f"{gen} has no program.pickle: build {game} without the disc first (hostgen --program-out)")
@@ -88,6 +116,10 @@ def kit(game: str, build: Path, out: Path, sysroot: Path | None, resource_dir: P
     shutil.copy2(config / cfg["asm"]["interface"], out / cfg["asm"]["interface"])
     if windows_zig and (config / EXPORTS).is_file():
         shutil.copy2(config / EXPORTS, out / EXPORTS)
+    meta = {"format": KIT_FORMAT, "game": game, "target": "windows" if windows_zig else "android"}
+    if linux_zig:
+        triple, folders = linux_target()
+        meta.update(target="linux", triple=triple, glibc_minor=LINUX_GLIBC_MINOR)
     # Every header a translation reads, found by the compiler the build used, each under the
     # include folder it was found in: user headers first, then the system's.
     dirs = [gen, ROOT / "port/game" / game / "host", ROOT / "port/game/common/include", ROOT / "port/runtime/include",
@@ -97,6 +129,8 @@ def kit(game: str, build: Path, out: Path, sysroot: Path | None, resource_dir: P
                           sysroot / "usr/include" if sysroot else None) if d]
     if windows_zig:
         system = [windows_zig / "lib/include", windows_zig / "lib/libc/include/any-windows-any"]
+    if linux_zig:
+        system = [linux_zig / "lib" / folder for folder in folders]
     with tempfile.TemporaryDirectory() as tmp:
         probe = Path(tmp) / "probe.c"
         probe.write_text("".join(f"#include {i}\n" for i in INCLUDES))
@@ -104,6 +138,8 @@ def kit(game: str, build: Path, out: Path, sysroot: Path | None, resource_dir: P
         if windows_zig:
             cmd[:1] = [str(windows_zig / "zig.exe"), "clang", f"--target={WINDOWS_TARGET}", "-nostdinc",
                        *[f"-isystem{d}" for d in system]]
+        if linux_zig:
+            cmd[:1] = [str(linux_zig / "zig"), "clang", *linux_flags(meta), *[f"-isystem{d}" for d in system]]
         if sysroot:
             cmd[1:1] = [f"--target={ANDROID_TARGET}", f"--sysroot={sysroot}"]
         if resource_dir:
@@ -121,10 +157,9 @@ def kit(game: str, build: Path, out: Path, sysroot: Path | None, resource_dir: P
         dest = out / "include" / str(home) / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, dest)
-    (out / "kit.json").write_text(json.dumps({"format": KIT_FORMAT, "game": game,
-                                              "target": "windows" if windows_zig else "android", "includes": [
-        [str(k), "system" if k >= len(dirs) else "user"] for k in range(len(dirs) + len(system))
-        if (out / "include" / str(k)).is_dir()]}, indent=1) + "\n")
+    meta["includes"] = [[str(k), "system" if k >= len(dirs) else "user"] for k in range(len(dirs) + len(system))
+                        if (out / "include" / str(k)).is_dir()]
+    (out / "kit.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(f"{out}: the kit for {game}'s part ({len(files)} headers)")
 
 
@@ -160,6 +195,10 @@ def is_windows(meta: dict) -> bool:
     return meta.get("target") == "windows"
 
 
+def is_linux(meta: dict) -> bool:
+    return meta.get("target") == "linux"
+
+
 def compile_all(sources: list[Path], kit_dir: Path, meta: dict, sysroot: Path | None, jobs: int) -> list[str]:
     """SOURCES compiled with the kit's headers; the objects."""
     clang = tools()[0]
@@ -173,6 +212,8 @@ def compile_all(sources: list[Path], kit_dir: Path, meta: dict, sysroot: Path | 
     if is_windows(meta):
         # Every Windows library is position independent; the flag is for the others.
         flags = [f for f in flags if f != "-fPIC"] + [f"--target={WINDOWS_TARGET}", "-nostdinc"]
+    if is_linux(meta):
+        flags += linux_flags(meta)
     print(f"compiling {len(sources)} files", flush=True)
     compiled = [0]
     lock = threading.Lock()
@@ -334,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     k.add_argument("--sysroot", type=Path, help="the NDK's sysroot, for an Android kit")
     k.add_argument("--resource-dir", type=Path, help="Clang's resource folder (its own headers)")
     k.add_argument("--windows-zig", type=Path, help="an unpacked Zig for Windows, for a Windows kit")
+    k.add_argument("--linux-zig", type=Path, help="an unpacked Zig for Linux on this processor, for a Linux kit")
     k.add_argument("--libs", type=Path, nargs="*", default=[],
                    help="what the link needs besides the game (crtbegin_so.o, crtend_so.o, libc.so, libm.so, builtins)")
     b = sub.add_parser("build")
@@ -359,7 +401,9 @@ def main(argv: list[str] | None = None) -> int:
         check(args.game, args.kit.resolve(), args.out.resolve())
         return 0
     if args.command == "kit":
-        kit(args.game, args.build, args.out, args.sysroot, args.resource_dir, args.windows_zig)
+        if args.windows_zig and args.linux_zig:
+            ap.error("--windows-zig and --linux-zig make different kits: name one")
+        kit(args.game, args.build, args.out, args.sysroot, args.resource_dir, args.windows_zig, args.linux_zig)
         if args.libs:
             (args.out / "lib").mkdir(exist_ok=True)
             for p in args.libs:
