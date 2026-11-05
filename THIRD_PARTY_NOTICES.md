@@ -31,7 +31,7 @@ and `vcruntime140_1.dll` beside the game programs, unmodified, so a player needs
 no Visual C++ Redistributable. They are Microsoft's, redistributable under the
 Visual Studio license terms, and are not part of OpenRAC.
 
-## Zig and mingw-w64
+## Zig, mingw-w64, glibc and Linux headers
 
 The Windows installers carry [Zig](https://ziglang.org)'s program (MIT; Clang and
 lld of LLVM in it, Apache-2.0 with LLVM exceptions), unmodified, and the headers of
@@ -39,6 +39,12 @@ Clang and [mingw-w64](https://www.mingw-w64.org) from its release (the system
 headers are in the public domain), to build the part of Going Commando that comes
 from the player's disc (`tools/asm_part.py`). Their licenses are carried in
 `port/build/release/licenses/zig`.
+
+The Linux installers (AppImage, .deb, .rpm) carry Zig's Linux program in the same
+way, with the headers of Clang, [glibc](https://www.gnu.org/software/libc/)
+(LGPL-2.1-or-later) and the Linux kernel's user-space API (GPL-2.0 WITH
+Linux-syscall-note) from its release, for the same part. Their notices are in
+the same folder.
 
 ## Embree
 

@@ -210,13 +210,12 @@ Their levels open in Godot and **Models and textures** works, but edits are
 not packed back. Their packs wait in Your mods
 ([editor/README.md](../editor/README.md#the-later-games-early-access)). Up
 Your Arsenal and Deadlocked are not playable yet. Going Commando's program
-still needs code from your disc. The Windows installer carries the game without
-that code and a small compiler: **Build and play** builds the missing part from
-your disc, with nothing to install or download, then gets its levels ready as
-Ratchet & Clank's does. On Linux and macOS no installer carries it: **Build and
-play** downloads OpenRAC's source and builds it from your disc. That needs a
-compiler, and says which is missing. On Linux it also needs SDL's X11, Wayland
-and audio development packages, such as `libxss-dev`.
+still needs code from your disc. The Windows and Linux installers carry the game
+without that code and a small compiler: **Build and play** builds the missing part
+from your disc, with nothing to install or download (on SteamOS too, which has no
+compiler), then gets its levels ready as Ratchet & Clank's does. On macOS no
+installer carries it: **Build and play** downloads OpenRAC's source and builds it
+from your disc. That needs a compiler, and says which is missing.
 
 ## Develop
 

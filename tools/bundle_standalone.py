@@ -95,9 +95,11 @@ GAMES = ("openrac-rac1-pal", "openrac-rac1-ntsc")
 # The tools carried beside them when the build has them: the enhanced lighting's probe baker
 # (tools/build_port.py --probe-baker), Embree built into it, including its interior inference stage.
 TOOLS = ("openrac-enhanced-baker",)
-# The games a Windows installer carries built without the disc, with a kit and Zig's Clang and lld
-# to build what is missing on the player's computer (tools/asm_part.py), as an APK does. Version -> port game.
+# The games a Windows or Linux installer carries built without the disc, with a kit and Zig's Clang
+# and lld to build what is missing on the player's computer (tools/asm_part.py), as an APK does: no
+# compiler of the player's (SteamOS has none, and no headers). Version -> port game.
 WINDOWS_PARTS = {"rac2/ntsc": "rac2-ntsc"}
+CARRIED_PARTS = WINDOWS_PARTS
 # Where the copy keeps that Zig (tools/asm_part.py ZIG_PROGRAM).
 PART_ZIG = "tools/part-zig"
 # What a Windows program built against MSVC's libraries imports and Windows does not always have:
@@ -208,19 +210,22 @@ def point_at(args: list[str], levels: str) -> list[str]:
 
 
 def player_actions(android: bool = False, android_games: set[str] | None = None,
-                   part_tags: dict[str, str] | None = None, windows_parts: set[str] | None = None) -> dict:
+                   part_tags: dict[str, str] | None = None, windows_parts: set[str] | None = None,
+                   linux_parts: set[str] | None = None) -> dict:
     """launcher/actions.json cut down to what works from a carried copy. ANDROID_GAMES: the
     games an APK carries (rac1-pal, ...); a Play for any other is not Android's there. PART_TAGS:
-    by game, what its part is built from (part_tag). WINDOWS_PARTS: the versions a Windows
-    installer carries built without the disc (WINDOWS_PARTS), which need no compiler of the player's."""
+    by game, what its part is built from (part_tag). WINDOWS_PARTS, LINUX_PARTS: the versions a
+    Windows or Linux installer carries built without the disc (CARRIED_PARTS), which need no
+    compiler of the player's."""
     source = json.loads((ROOT / "launcher/actions.json").read_text())
     out = {key: value for key, value in source.items() if key not in ("repository", "versions")}
     out["repository"] = []
     out["versions"] = {}
     for key, actions in source["versions"].items():
         levels = levels_folder(key)
-        windows_part = key in (windows_parts or set())
-        game = None if android or windows_part else PLAYER_BUILDS.get(key)
+        part_platform = ("windows" if key in (windows_parts or set())
+                         else "linux" if key in (linux_parts or set()) else None)
+        game = None if android or part_platform else PLAYER_BUILDS.get(key)
         kept = []
         for action in actions:
             if game and action["id"] == "port-build":
@@ -295,8 +300,8 @@ def player_actions(android: bool = False, android_games: set[str] | None = None,
         tag = (part_tags or {}).get(key.replace("/", "-"))
         if android:
             kept = carried_part(kept, tag)
-        elif windows_part:
-            kept = carried_part(kept, tag, "windows")
+        elif part_platform:
+            kept = carried_part(kept, tag, part_platform)
         out["versions"][key] = kept
     return out
 
@@ -322,6 +327,37 @@ def strip_debug(path: Path) -> bool:
         return False
     proc.run([tool, "--strip-debug", path])
     return True
+
+
+def kit_target(out: Path, game: str) -> str:
+    """The system GAME's kit in the copy OUT builds a part for: windows, linux or android."""
+    return json.loads((out / "port/asm-part" / game / "kit.json").read_text(encoding="utf-8")).get("target", "android")
+
+
+def carry_zig(zig: Path, out: Path, linux: bool) -> list[str]:
+    """The unpacked Zig ZIG's program into the copy OUT (PART_ZIG), with the notices of what it is
+    and what the kit took from it, where the copy's other notices are: Zig's, LLVM's (its Clang and
+    lld, and Clang's headers), and mingw-w64's on Windows, or glibc's and Linux's (their headers)
+    on Linux."""
+    name = "zig" if linux else "zig.exe"
+    (out / PART_ZIG).mkdir(parents=True)
+    shutil.copy2(zig / name, out / PART_ZIG / name)
+    notices = out / "port/build/release/licenses/zig"
+    notices.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(zig / "LICENSE", notices / "LICENSE")
+    shutil.copy2(zig / "lib/libcxx/LICENSE.TXT", notices / "LLVM-LICENSE.TXT")
+    if linux:
+        for source, dest in (("lib/libc/glibc/LICENSES", "GLIBC-LICENSES"),
+                             ("lib/libc/glibc/COPYING.LIB", "GLIBC-COPYING.LIB")):
+            if (zig / source).is_file():
+                shutil.copy2(zig / source, notices / dest)
+        (notices / "LINUX-HEADERS.txt").write_text(
+            "The Linux kernel's user-space API headers in the kit (Zig's lib/libc/include/*-linux-any) are\n"
+            "GPL-2.0 WITH Linux-syscall-note: a program that includes them is not a derived work of the kernel.\n",
+            encoding="utf-8")
+    else:
+        shutil.copy2(zig / "lib/libc/mingw/COPYING", notices / "MINGW-W64-COPYING")
+    return ["Zig"]
 
 
 def copy_games(build: Path, dest: Path, extra: tuple[str, ...] = ()) -> list[str]:
@@ -364,7 +400,8 @@ def main() -> int:
     parser.add_argument("--android", action="store_true", help="the Android launcher's copy (tools/build_android.py)")
     parser.add_argument("--asm-part-kit", type=Path, action="append", default=[], metavar="KIT",
                         help="a game's kit for the part built from the disc (tools/asm_part.py kit)")
-    parser.add_argument("--part-zig", type=Path, help="with --asm-part-kit, on Windows: an unpacked Zig for Windows")
+    parser.add_argument("--part-zig", type=Path,
+                        help="with --asm-part-kit, on Windows or Linux: an unpacked Zig for this system and processor")
     parser.add_argument("--android-games", metavar="ID,...",
                         help="with --android: the games the APK carries (rac1-pal,rac1-ntsc); Play is Android's for those only")
     args = parser.parse_args()
@@ -414,11 +451,14 @@ def main() -> int:
     shutil.copy2(ROOT / "progress/summary.json", out / "progress/summary.json")
     (out / "launcher").mkdir(exist_ok=True)
     android_games = set(args.android_games.split(",")) if args.android and args.android_games else None
-    windows_parts = {key for key, game in WINDOWS_PARTS.items() if args.part_zig and part_tag(out, game)}
-    tags = {game: tag for game in (android_games or set()) | {WINDOWS_PARTS[key] for key in windows_parts}
+    # The kit says which system it builds a part for (tools/asm_part.py kit.json "target").
+    parts = {key: kit_target(out, game) for key, game in CARRIED_PARTS.items() if args.part_zig and part_tag(out, game)}
+    windows_parts = {key for key, target in parts.items() if target == "windows"}
+    linux_parts = {key for key, target in parts.items() if target == "linux"}
+    tags = {game: tag for game in (android_games or set()) | {CARRIED_PARTS[key] for key in parts}
             if (tag := part_tag(out, game))}
     (out / "launcher/actions.json").write_text(
-        json.dumps(player_actions(args.android, android_games, tags, windows_parts), indent=2) + "\n")
+        json.dumps(player_actions(args.android, android_games, tags, windows_parts, linux_parts), indent=2) + "\n")
     for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
         if (ROOT / name).is_file():
             shutil.copy2(ROOT / name, out / name)
@@ -427,16 +467,17 @@ def main() -> int:
     if args.game_build:
         dest = out / "port/build/release"
         dest.mkdir(parents=True, exist_ok=True)
-        carried += copy_games(args.game_build, dest, tuple(f"openrac-{WINDOWS_PARTS[key]}" for key in windows_parts))
+        carried += copy_games(args.game_build, dest, tuple(f"openrac-{CARRIED_PARTS[key]}" for key in parts))
         # The libraries the game was linked against as files of their own (SDL3 when it is not
         # built into the program).
         for pattern in ("*.dll", "*.dylib", "*.so", "*.so.*"):
             for path in sorted(args.game_build.glob(pattern)):
                 shutil.copy2(path, dest / path.name, follow_symlinks=True)
                 carried.append(path.name)
-        for key in windows_parts:
-            if f"openrac-{WINDOWS_PARTS[key]}.exe" not in carried:
-                sys.exit(f"{args.game_build} has no openrac-{WINDOWS_PARTS[key]}.exe, and the copy carries its kit")
+        for key in parts:
+            program = f"openrac-{CARRIED_PARTS[key]}" + (".exe" if key in windows_parts else "")
+            if program not in carried:
+                sys.exit(f"{args.game_build} has no {program}, and the copy carries its kit")
         if any(name.endswith(".exe") for name in carried):
             carried += copy_windows_runtime(Path(os.environ["SystemRoot"]) / "System32", dest)
         # Carry notices for dependencies built into either the game or its optional baking tools.
@@ -446,16 +487,7 @@ def main() -> int:
         if not any(name.split("/")[-1].startswith(GAMES[0]) for name in carried):
             sys.exit(f"{args.game_build} has no {GAMES[0]}: build it first (tools/build_port.py rac1-pal)")
     if args.part_zig:
-        (out / PART_ZIG).mkdir(parents=True)
-        shutil.copy2(args.part_zig / "zig.exe", out / PART_ZIG / "zig.exe")
-        # Zig's license, LLVM's (its Clang and lld) and mingw-w64's (the headers in the kit), where
-        # the copy's other notices are.
-        notices = out / "port/build/release/licenses/zig"
-        notices.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(args.part_zig / "LICENSE", notices / "LICENSE")
-        shutil.copy2(args.part_zig / "lib/libcxx/LICENSE.TXT", notices / "LLVM-LICENSE.TXT")
-        shutil.copy2(args.part_zig / "lib/libc/mingw/COPYING", notices / "MINGW-W64-COPYING")
-        carried.append("Zig")
+        carried += carry_zig(args.part_zig, out, bool(linux_parts))
     if args.python and args.android:
         if not any(args.python.glob("lib/python3.*/os.py")):
             sys.exit(f"{args.python} is not a PYTHONHOME for Android (no lib/python3.N/os.py)")

@@ -86,6 +86,25 @@ class PlayerActions(unittest.TestCase):
         self.assertNotIn("port-build", rac2)
         self.assertEqual(play["artifact"], "port/build/release/openrac-rac2-ntsc.exe")
 
+    def test_a_linux_installer_builds_going_commandos_part_with_no_compiler_of_the_players(self):
+        # SteamOS has no compiler, CMake or headers: a player's own build (tools/build_game.py) cannot
+        # work there, so the copy carries the game built without the disc, a kit and Zig.
+        linux = bundle.player_actions(linux_parts={"rac2/ntsc"}, part_tags={"rac2-ntsc": "abc123"})
+        rac2 = {a["id"]: a for a in linux["versions"]["rac2/ntsc"]}
+        part, play = rac2["port-part"], rac2["play"]
+        made = "{data}/asm-part/abc123/libopenrac-rac2-ntsc-part.so"
+        self.assertEqual(part["makes"], made)
+        self.assertEqual(part["platforms"], ["linux"])
+        self.assertEqual(part["args"][:3], ["tools/asm_part.py", "build", "rac2-ntsc"])
+        self.assertEqual(play["args"][-2:], ["--asm-part", made])
+        self.assertIn(made, [n["path"] for n in play["needs"]])
+        self.assertNotIn("port-build", rac2)
+        self.assertEqual(play["artifact"], "port/build/release/openrac-rac2-ntsc.exe")
+        # A Linux copy without the kit keeps the player's own build.
+        plain = {a["id"]: a for a in bundle.player_actions()["versions"]["rac2/ntsc"]}
+        self.assertEqual(plain["port-build"]["args"][0], "tools/build_game.py")
+        self.assertEqual(plain["port-part"]["platforms"], ["android"])
+
     def test_only_what_a_player_does(self):
         self.assertEqual(self.actions["repository"], [])
         for key, actions in self.actions["versions"].items():
@@ -462,6 +481,48 @@ class Bundle(unittest.TestCase):
             self.assertFalse((out / "port/enhanced/tools/baker").exists())
             self.assertTrue((out / "port/enhanced/lighting/profiles/rac1-ntsc/level_01/probe-bake.json").is_file())
             self.assertIn("Android", (out / "STANDALONE").read_text())
+
+
+
+class CarriedZig(unittest.TestCase):
+    def zig(self, root: Path) -> Path:
+        zig = root / "zig-unpacked"
+        for rel in ("zig", "zig.exe", "LICENSE", "lib/libcxx/LICENSE.TXT", "lib/libc/mingw/COPYING",
+                    "lib/libc/glibc/LICENSES"):
+            (zig / rel).parent.mkdir(parents=True, exist_ok=True)
+            (zig / rel).write_text(rel)
+        (zig / "zig").chmod(0o755)
+        return zig
+
+    def test_a_linux_copy_carries_zigs_program_and_the_kits_notices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "copy"
+            self.assertEqual(bundle.carry_zig(self.zig(root), out, linux=True), ["Zig"])
+            self.assertEqual((out / bundle.PART_ZIG / "zig").read_text(), "zig")
+            self.assertFalse((out / bundle.PART_ZIG / "zig.exe").exists())
+            notices = out / "port/build/release/licenses/zig"
+            self.assertEqual({p.name for p in notices.iterdir()},
+                             {"LICENSE", "LLVM-LICENSE.TXT", "GLIBC-LICENSES", "LINUX-HEADERS.txt"})
+
+    def test_a_windows_copy_carries_zig_exe_and_mingws_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "copy"
+            bundle.carry_zig(self.zig(root), out, linux=False)
+            self.assertTrue((out / bundle.PART_ZIG / "zig.exe").is_file())
+            self.assertTrue((out / "port/build/release/licenses/zig/MINGW-W64-COPYING").is_file())
+
+    def test_the_kit_says_which_system_it_builds_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            kit = out / "port/asm-part/rac2-ntsc"
+            kit.mkdir(parents=True)
+            for target in ("linux", "windows"):
+                (kit / "kit.json").write_text(json.dumps({"target": target}))
+                self.assertEqual(bundle.kit_target(out, "rac2-ntsc"), target)
+            (kit / "kit.json").write_text("{}")
+            self.assertEqual(bundle.kit_target(out, "rac2-ntsc"), "android")
 
 
 if __name__ == "__main__":
